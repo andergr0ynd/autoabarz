@@ -7,7 +7,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('v1.6.63')
+script_version('1.6.63')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -2836,26 +2836,99 @@ scanState.verNewer = function(remote, localv)
     return false
 end
 
+scanState.isHtmlHead = function(s)
+    s = tostring(s or ''):gsub('^%s+', ''):sub(1, 96):lower()
+    return s:sub(1, 9) == '<!doctype' or s:sub(1, 5) == '<html'
+end
+
+scanState.readAll = function(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil end
+    local s = f:read('*a')
+    f:close()
+    return s
+end
+
+scanState.ghMirrors = function(name)
+    name = tostring(name or 'autoabarz.lua')
+    return {
+        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/' .. name,
+        'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/' .. name,
+        'https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/' .. name,
+    }
+end
+
+-- Как autozatochka: downloadUrlToFile (с wait в lua_thread) + requests. Не вызывать из pcall.
+scanState.dlMoon = function(url, path, timeout)
+    if type(downloadUrlToFile) ~= 'function' then return false end
+    local okm, ml = pcall(require, 'moonloader')
+    if not (okm and ml and ml.download_status) then return false end
+    local d = ml.download_status
+    pcall(os.remove, path)
+    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local done, success = false, false
+    downloadUrlToFile(bust, path, function(_, status)
+        if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
+            done, success = true, true
+        end
+    end)
+    local t0 = os.clock()
+    timeout = tonumber(timeout) or 45
+    while not done and os.clock() - t0 < timeout do
+        wait(50)
+    end
+    if not success or not doesFileExist(path) then return false end
+    wait(150)
+    local body = scanState.readAll(path)
+    return type(body) == 'string' and #body >= 8 and not scanState.isHtmlHead(body)
+end
+
+scanState.dlReq = function(url, path, timeout)
+    local ok_req, requests = pcall(require, 'requests')
+    if not (ok_req and requests and requests.get) then return false end
+    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local ok, resp = pcall(requests.get, bust, {
+        timeout = timeout or 30,
+        allow_redirects = true,
+        headers = { ['User-Agent'] = 'Mozilla/5.0 AutoABarz/1.6' },
+    })
+    if not ok or not resp or type(resp.text) ~= 'string' or #resp.text < 8 then return false end
+    if resp.status_code and resp.status_code >= 400 then return false end
+    if scanState.isHtmlHead(resp.text) then return false end
+    local f = io.open(path, 'wb')
+    if not f then return false end
+    f:write(resp.text)
+    f:close()
+    return true
+end
+
+scanState.dlMirrors = function(name, path, timeout)
+    local urls = scanState.ghMirrors(name)
+    for i = 1, #urls do
+        if scanState.dlMoon(urls[i], path, timeout) then return true end
+        if scanState.dlReq(urls[i], path, timeout) then return true end
+    end
+    return false
+end
+
 scanState.gitlabGet = function(file, timeout, cb)
     file = tostring(file or 'autoabarz.lua')
-    -- github.com/.../raw/... редиректит на HTML у LuaSocket.
-    -- Сразу raw.githubusercontent.com — это те же файлы, что по ссылкам пользователя.
-    local name = 'autoabarz.lua'
-    if file:find('version.json', 1, true) then name = 'version.json' end
-    local url = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/' .. name
-    local hdrs = {
-        ['User-Agent'] = 'Mozilla/5.0 AutoABarz/1.6',
-        ['Accept'] = '*/*',
-    }
-    if type(scanState.gitlabToken) == 'string' and scanState.gitlabToken ~= '' then
-        hdrs['Authorization'] = 'Bearer ' .. scanState.gitlabToken
-    end
-    httpRequestAsync('GET', url, '', hdrs, cb, timeout or 30)
+    local name = file:find('version.json', 1, true) and 'version.json' or 'autoabarz.lua'
+    lua_thread.create(function()
+        local path = DATA_DIR .. '\\upd_' .. name
+        pcall(ensureDir, DATA_DIR)
+        local ok = scanState.dlMirrors(name, path, timeout or 30)
+        local body = ok and scanState.readAll(path) or nil
+        pcall(os.remove, path)
+        if type(cb) == 'function' then
+            if type(body) == 'string' then cb(body, nil, 200) else cb(nil, 'download failed', 0) end
+        end
+    end)
 end
 
 scanState.applyUpdate = function(body, latest)
     if type(body) ~= 'string' or #body < 4000 then return false, 'файл короткий' end
-    if body:find('<html', 1, true) or body:find('<HTML', 1, true) or body:find('<!DOCTYPE', 1, true) then
+    if scanState.isHtmlHead(body) then
         return false, 'пришла страница, не lua'
     end
     if not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
