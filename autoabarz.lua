@@ -1,14 +1,14 @@
 --[[
-    AutoABarz — тот же ABarz + автообновление с GitLab.
+    AutoABarz — тот же ABarz + автообновление с GitHub.
     /abarz  /abscan  /carprice  /abchat  /abupdate
-    Репозиторий: gitlab.com/pechkinbl/autoabarz  (ветка main)
+    Репозиторий: github.com/andergr0ynd/autoabarz  (ветка main)
     Файлы: autoabarz.lua  version.json
 ]]
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.61')
-script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitLab')
+script_version('1.6.62')
+script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
 local ffi = require 'ffi'
@@ -182,7 +182,7 @@ scanState.chatBindOn = new.bool(true)
 scanState.mouseBindOn = new.bool(true)
 scanState.autoUpdateOn = new.bool(true)
 scanState.bindHeld = {}
-scanState.gitlabRaw = 'https://gitlab.com/pechkinbl/autoabarz/-/raw/main/'
+scanState.gitlabRaw = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/'
 scanState.gitlabToken = ''
 scanState.updateBusy = false
 
@@ -2717,7 +2717,7 @@ local function httpRequestAsync(method, url, body, headers, callback, timeout)
                     if loc and loc ~= '' then
                         loc = tostring(loc)
                         if not loc:find('^https?://') then
-                            local origin = tostring(u):match('^(https?://[^/]+)') or 'https://gitlab.com'
+                            local origin = tostring(u):match('^(https?://[^/]+)') or 'https://raw.githubusercontent.com'
                             if loc:sub(1, 1) ~= '/' then loc = '/' .. loc end
                             loc = origin .. loc
                         end
@@ -2838,17 +2838,17 @@ end
 
 scanState.gitlabGet = function(file, timeout, cb)
     file = tostring(file or 'autoabarz.lua')
-    -- /-/blob/ в браузере — HTML-страница. Качаем через API, там всегда сырой файл.
+    -- github.com/.../raw/... редиректит на HTML у LuaSocket.
+    -- Сразу raw.githubusercontent.com — это те же файлы, что по ссылкам пользователя.
     local name = 'autoabarz.lua'
     if file:find('version.json', 1, true) then name = 'version.json' end
-    local url = 'https://gitlab.com/api/v4/projects/pechkinbl%2Fautoabarz/repository/files/'
-        .. name .. '/raw?ref=main'
+    local url = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/' .. name
     local hdrs = {
         ['User-Agent'] = 'Mozilla/5.0 AutoABarz/1.6',
         ['Accept'] = '*/*',
     }
     if type(scanState.gitlabToken) == 'string' and scanState.gitlabToken ~= '' then
-        hdrs['PRIVATE-TOKEN'] = scanState.gitlabToken
+        hdrs['Authorization'] = 'Bearer ' .. scanState.gitlabToken
     end
     httpRequestAsync('GET', url, '', hdrs, cb, timeout or 30)
 end
@@ -2892,11 +2892,11 @@ scanState.checkUpdate = function(manual)
     end
     scanState.updateBusy = true
     local cur = tostring(thisScript().version or '0')
-    if manual then chat('Проверяю GitLab…') end
+    if manual then chat('Проверяю GitHub…') end
     scanState.gitlabGet('version.json', 20, function(res, err, code)
         if type(res) ~= 'string' or res == '' then
             scanState.updateBusy = false
-            if manual then chat('GitLab недоступен' .. (err and (': ' .. tostring(err)) or '')) end
+            if manual then chat('GitHub недоступен' .. (err and (': ' .. tostring(err)) or '')) end
             return
         end
         local ok, data = safeDecodeJson(res)
@@ -3410,7 +3410,9 @@ scanState.loadSettings = function()
         if data.mouseOn ~= nil then scanState.mouseBindOn[0] = not not data.mouseOn end
         if data.autoOn ~= nil then scanState.autoUpdateOn[0] = not not data.autoOn end
         if type(data.gitlabRaw) == 'string' and data.gitlabRaw:find('https://', 1, true)
-            and data.gitlabRaw:find('pechkinbl', 1, true) then
+            and data.gitlabRaw:find('andergr0ynd', 1, true)
+            and (data.gitlabRaw:find('github.com', 1, true)
+                or data.gitlabRaw:find('githubusercontent', 1, true)) then
             scanState.gitlabRaw = data.gitlabRaw
         end
         if type(data.gitlabToken) == 'string' then
@@ -3785,12 +3787,12 @@ local function drawScan()
     imgui.TextDisabled('Мышь в чате — удерживать.')
 
     spaced(0, 14)
-    sectionTitle('Автообновление GitLab')
+    sectionTitle('Автообновление GitHub')
     if imgui.Checkbox('Проверять при загрузке', scanState.autoUpdateOn) then scanState.saveSettings() end
     if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
         scanState.checkUpdate(true)
     end
-    imgui.TextDisabled('Репозиторий: gitlab.com/pechkinbl/autoabarz')
+    imgui.TextDisabled('github.com/andergr0ynd/autoabarz')
     imgui.TextDisabled('/abupdate — проверить вручную')
 end
 
