@@ -1,4 +1,5 @@
 {
-  "latest": "v1.6.63",
+  "latest": "1.6.64",
+  "file": "autoabarz.lua",
   "updateurl": "https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/autoabarz.lua"
 }
