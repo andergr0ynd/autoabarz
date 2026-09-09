@@ -7,7 +7,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.63')
+script_version('1.6.64')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
