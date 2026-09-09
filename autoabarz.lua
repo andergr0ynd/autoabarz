@@ -2,7 +2,7 @@
     AutoABarz — тот же ABarz + автообновление с GitHub.
     /abarz  /abscan  /carprice  /abchat  /abupdate
     Репозиторий: github.com/andergr0ynd/autoabarz  (ветка main)
-    Файлы: autoabarz.lua  version.json
+    На GitHub заливай: autoabarz.lua + version.json. Не клади abarz.lua рядом в moonloader.
 ]]
 
 script_name('AutoABarz')
@@ -182,8 +182,6 @@ scanState.chatBindOn = new.bool(true)
 scanState.mouseBindOn = new.bool(true)
 scanState.autoUpdateOn = new.bool(true)
 scanState.bindHeld = {}
-scanState.gitlabRaw = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/'
-scanState.gitlabToken = ''
 scanState.updateBusy = false
 
 local scanFab = { pollAt = 0, pollBusy = false, cmd = '' }
@@ -2858,7 +2856,7 @@ scanState.ghMirrors = function(name)
     }
 end
 
--- Как autozatochka: downloadUrlToFile (с wait в lua_thread) + requests. Не вызывать из pcall.
+-- Скачивание как в autozatochka: downloadUrlToFile + requests, только из lua_thread.
 scanState.dlMoon = function(url, path, timeout)
     if type(downloadUrlToFile) ~= 'function' then return false end
     local okm, ml = pcall(require, 'moonloader')
@@ -2911,7 +2909,7 @@ scanState.dlMirrors = function(name, path, timeout)
     return false
 end
 
-scanState.gitlabGet = function(file, timeout, cb)
+scanState.githubGet = function(file, timeout, cb)
     file = tostring(file or 'autoabarz.lua')
     local name = file:find('version.json', 1, true) and 'version.json' or 'autoabarz.lua'
     lua_thread.create(function()
@@ -2966,7 +2964,7 @@ scanState.checkUpdate = function(manual)
     scanState.updateBusy = true
     local cur = tostring(thisScript().version or '0')
     if manual then chat('Проверяю GitHub…') end
-    scanState.gitlabGet('version.json', 20, function(res, err, code)
+    scanState.githubGet('version.json', 20, function(res, err, code)
         if type(res) ~= 'string' or res == '' then
             scanState.updateBusy = false
             if manual then chat('GitHub недоступен' .. (err and (': ' .. tostring(err)) or '')) end
@@ -2985,7 +2983,7 @@ scanState.checkUpdate = function(manual)
             return
         end
         chat(('Есть обновление: %s → %s'):format(cur, latest))
-        scanState.gitlabGet('autoabarz.lua', 60, function(body, err2)
+        scanState.githubGet('autoabarz.lua', 60, function(body, err2)
             if type(body) ~= 'string' then
                 scanState.updateBusy = false
                 chat('Не скачался скрипт' .. (err2 and (': ' .. tostring(err2)) or ''))
@@ -3460,8 +3458,6 @@ scanState.saveSettings = function()
             chatOn = not not scanState.chatBindOn[0],
             mouseOn = not not scanState.mouseBindOn[0],
             autoOn = not not scanState.autoUpdateOn[0],
-            gitlabRaw = tostring(scanState.gitlabRaw or ''),
-            gitlabToken = tostring(scanState.gitlabToken or ''),
         }))
         f:close()
     end)
@@ -3482,15 +3478,6 @@ scanState.loadSettings = function()
         if data.chatOn ~= nil then scanState.chatBindOn[0] = not not data.chatOn end
         if data.mouseOn ~= nil then scanState.mouseBindOn[0] = not not data.mouseOn end
         if data.autoOn ~= nil then scanState.autoUpdateOn[0] = not not data.autoOn end
-        if type(data.gitlabRaw) == 'string' and data.gitlabRaw:find('https://', 1, true)
-            and data.gitlabRaw:find('andergr0ynd', 1, true)
-            and (data.gitlabRaw:find('github.com', 1, true)
-                or data.gitlabRaw:find('githubusercontent', 1, true)) then
-            scanState.gitlabRaw = data.gitlabRaw
-        end
-        if type(data.gitlabToken) == 'string' then
-            scanState.gitlabToken = data.gitlabToken
-        end
     end)
 end
 
