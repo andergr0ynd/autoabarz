@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.7')
+script_version('1.6.71')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -30,7 +30,7 @@ local ok_ev, ev = pcall(require, 'samp.events')
 if not ok_ev then ok_ev, ev = pcall(require, 'lib.samp.events') end
 
 local new = imgui.new
-local TAG = '{5B8CFF}[ABarz] {FFFFFF}'
+local TAG = '{5B8CFF}[] {FFFFFF}'
 
 local function is_valid_utf8(s)
     if type(s) ~= 'string' then return false end
@@ -4076,7 +4076,7 @@ local function drawSidebar()
             setChatEnabled(not chatOn[0])
         end
         imgui.SetCursorPos(imgui.ImVec2(18, WIN_H - 40))
-        imgui.TextDisabled('/abarz  закрыть')
+        imgui.TextDisabled('/abarz  закрыть | /abprice [Название]')
     imgui.EndChild()
 end
 
