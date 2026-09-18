@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.66')
+script_version('1.6.69')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -175,7 +175,7 @@ local scanState = {
 scanState.menuBindOn = new.bool(true)
 scanState.chatBindOn = new.bool(true)
 scanState.mouseBindOn = new.bool(true)
-scanState.autoUpdateOn = new.bool(true)
+scanState.autoUpdateOn = new.bool(false)
 scanState.bindHeld = {}
 scanState.updateBusy = false
 scanState.forceCloseUi = false
@@ -2933,7 +2933,7 @@ scanState.pumpHttpJobs = function()
     scanState.httpJobs = rest
 end
 
--- Автообновление: version.json + temp-файл. reload из UI/колбэка скачивания крашит lua51.dll.
+-- Автообновление через effil (как ntfy/share). downloadUrlToFile + wait() в колбэке крашит lua51.dll.
 local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/version.json'
 local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/autoabarz.lua'
 
@@ -2942,37 +2942,64 @@ scanState.isHtmlHead = function(s)
     return s:sub(1, 9) == '<!doctype' or s:sub(1, 5) == '<html'
 end
 
-scanState.readAll = function(path)
-    local f = io.open(path, 'rb')
-    if not f then return nil end
-    local s = f:read('*a')
-    f:close()
-    return s
+scanState.fetchUrls = function(urls, timeout, minLen, cb)
+    local i = 0
+    local function tryNext()
+        i = i + 1
+        if i > #urls then
+            cb(nil)
+            return
+        end
+        httpRequestAsync('GET', urls[i], '', {
+            ['User-Agent'] = 'AutoABarz',
+            ['Accept'] = '*/*',
+        }, function(body, err)
+            body = tostring(body or '')
+            if not err and #body >= (minLen or 8) and not scanState.isHtmlHead(body) then
+                cb(body)
+            else
+                tryNext()
+            end
+        end, timeout)
+    end
+    tryNext()
 end
 
-scanState.dlTo = function(url, path, timeout)
-    if type(downloadUrlToFile) ~= 'function' then return false end
-    local okm, ml = pcall(require, 'moonloader')
-    local d = okm and ml and ml.download_status
-    if not d then return false end
-    if doesFileExist(path) then pcall(os.remove, path) end
-    local bust = tostring(url) .. (tostring(url):find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
-    local done = false
-    downloadUrlToFile(bust, path, function(_, status)
-        if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
-            done = true
+scanState.writeUpdateFile = function(latest, body)
+    if type(body) ~= 'string' or #body < 4000
+        or not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
+        scanState.updateBusy = false
+        chat('Обновление прошло неудачно. Запускаю текущую версию.')
+        return
+    end
+    local path = thisScript().path
+    if type(path) ~= 'string' or path == '' then
+        scanState.updateBusy = false
+        chat('Нет пути скрипта')
+        return
+    end
+    pcall(function()
+        local old = io.open(path, 'rb')
+        if old then
+            local prev = old:read('*a')
+            old:close()
+            local b = io.open(path .. '.bak', 'wb')
+            if b then b:write(prev) b:close() end
         end
     end)
-    local t0 = os.clock()
-    timeout = tonumber(timeout) or 12
-    while not done and os.clock() - t0 < timeout do
-        wait(100)
+    local f = io.open(path, 'wb')
+    if not f then
+        scanState.updateBusy = false
+        chat('Не записалось обновление')
+        return
     end
-    wait(150)
-    if not doesFileExist(path) then return false end
-    local body = scanState.readAll(path)
-    if type(body) ~= 'string' or #body < 8 or scanState.isHtmlHead(body) then return false end
-    return true, body
+    f:write(body)
+    f:close()
+    scanState.forceCloseUi = true
+    scanState.updateBusy = false
+    chat(('Файл обновлён до %s. Меню закрыто.'):format(latest))
+    chat('Перезагрузи скрипт: /reload  или перезайди в игру.')
+    chat('Не жми обновление повторно, пока не сделаешь /reload.')
 end
 
 scanState.checkUpdate = function(manual)
@@ -2980,22 +3007,17 @@ scanState.checkUpdate = function(manual)
         if manual then chat('Обновление уже идёт') end
         return
     end
+    if not ok_effil then
+        if manual then chat('Нет сети (effil)') end
+        return
+    end
     scanState.updateBusy = true
-    lua_thread.create(function()
-        if manual then chat('Проверяю GitHub…') end
-        pcall(ensureDir, DATA_DIR)
-        local tmp = DATA_DIR .. '\\upd_version.json'
-        local jsonUrls = {
-            UPDATE_JSON,
-            'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/version.json',
-        }
-        local ok, raw
-        for i = 1, #jsonUrls do
-            ok, raw = scanState.dlTo(jsonUrls[i], tmp, 12)
-            if ok then break end
-        end
-        pcall(os.remove, tmp)
-        if not ok or type(raw) ~= 'string' then
+    if manual then chat('Проверяю GitHub…') end
+    scanState.fetchUrls({
+        UPDATE_JSON,
+        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/version.json',
+    }, 12, 8, function(raw)
+        if type(raw) ~= 'string' then
             scanState.updateBusy = false
             if manual then chat('GitHub недоступен') end
             return
@@ -3018,55 +3040,13 @@ scanState.checkUpdate = function(manual)
             updateurl = UPDATE_LUA
         end
         chat(('Есть обновление: %s -> %s'):format(cur, latest))
-        wait(250)
-        local tmpLua = DATA_DIR .. '\\upd_autoabarz.lua'
-        local luaUrls = {
+        scanState.fetchUrls({
             updateurl,
             UPDATE_LUA,
             'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/autoabarz.lua',
-        }
-        local okLua, body
-        for i = 1, #luaUrls do
-            okLua, body = scanState.dlTo(luaUrls[i], tmpLua, 45)
-            if okLua and type(body) == 'string' and #body >= 4000 then break end
-            okLua, body = false, nil
-        end
-        pcall(os.remove, tmpLua)
-        if not okLua or type(body) ~= 'string' or #body < 4000
-            or not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
-            scanState.updateBusy = false
-            chat('Обновление прошло неудачно. Запускаю текущую версию.')
-            return
-        end
-        local path = thisScript().path
-        if type(path) ~= 'string' or path == '' then
-            scanState.updateBusy = false
-            chat('Нет пути скрипта')
-            return
-        end
-        local bak = path .. '.bak'
-        pcall(function()
-            local old = io.open(path, 'rb')
-            if old then
-                local prev = old:read('*a')
-                old:close()
-                local b = io.open(bak, 'wb')
-                if b then b:write(prev) b:close() end
-            end
+        }, 45, 4000, function(body)
+            scanState.writeUpdateFile(latest, body)
         end)
-        local f = io.open(path, 'wb')
-        if not f then
-            scanState.updateBusy = false
-            chat('Не записалось обновление')
-            return
-        end
-        f:write(body)
-        f:close()
-        scanState.forceCloseUi = true
-        scanState.updateBusy = false
-        chat(('Файл обновлён до %s. Меню закрыто.'):format(latest))
-        chat('Перезагрузи скрипт: /reload  или перезайди в игру.')
-        chat('Не жми обновление повторно, пока не сделаешь /reload.')
     end)
 end
 
@@ -3551,7 +3531,6 @@ scanState.loadSettings = function()
         if data.menuOn ~= nil then scanState.menuBindOn[0] = not not data.menuOn end
         if data.chatOn ~= nil then scanState.chatBindOn[0] = not not data.chatOn end
         if data.mouseOn ~= nil then scanState.mouseBindOn[0] = not not data.mouseOn end
-        if data.autoOn ~= nil then scanState.autoUpdateOn[0] = not not data.autoOn end
     end)
 end
 
@@ -3931,11 +3910,11 @@ local function drawScan()
 
     spaced(0, 14)
     sectionTitle('Автообновление GitHub')
-    if imgui.Checkbox('Проверять при загрузке', scanState.autoUpdateOn) then scanState.saveSettings() end
+    if imgui.Checkbox('Проверять через 45 сек после спавна', scanState.autoUpdateOn) then scanState.saveSettings() end
     if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
         scanState.checkUpdate(true)
     end
-    imgui.TextDisabled('Файл сохраняется на диск. После обновления: /reload')
+    imgui.TextDisabled('При входе само не качает. После обновления: /reload')
     imgui.TextDisabled('github.com/andergr0ynd/autoabarz')
     imgui.TextDisabled('/abupdate — проверить вручную')
 end
@@ -4362,8 +4341,20 @@ function main()
     end)
     if scanState.autoUpdateOn[0] then
         lua_thread.create(function()
-            wait(2500)
-            scanState.checkUpdate(false)
+            local t0 = os.clock()
+            while os.clock() - t0 < 45 do wait(500) end
+            for _ = 1, 60 do
+                local spawned = false
+                pcall(function()
+                    spawned = sampIsLocalPlayerSpawned and sampIsLocalPlayerSpawned()
+                end)
+                if spawned then break end
+                wait(1000)
+            end
+            wait(2000)
+            if not scanState.updateBusy then
+                scanState.checkUpdate(false)
+            end
         end)
     end
 
