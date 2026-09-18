@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.65')
+script_version('1.6.66')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -178,6 +178,7 @@ scanState.mouseBindOn = new.bool(true)
 scanState.autoUpdateOn = new.bool(true)
 scanState.bindHeld = {}
 scanState.updateBusy = false
+scanState.forceCloseUi = false
 
 local scanFab = { pollAt = 0, pollBusy = false, cmd = '' }
 
@@ -2932,7 +2933,7 @@ scanState.pumpHttpJobs = function()
     scanState.httpJobs = rest
 end
 
--- Автообновление как в FHelper: version.json (latest, updateurl) + downloadUrlToFile + reload
+-- Автообновление: version.json + temp-файл. reload из UI/колбэка скачивания крашит lua51.dll.
 local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/version.json'
 local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/autoabarz.lua'
 
@@ -3061,10 +3062,11 @@ scanState.checkUpdate = function(manual)
         end
         f:write(body)
         f:close()
-        chat(('Обновлён до %s. Перезагрузка…'):format(latest))
-        wait(500)
+        scanState.forceCloseUi = true
         scanState.updateBusy = false
-        pcall(function() thisScript():reload() end)
+        chat(('Файл обновлён до %s. Меню закрыто.'):format(latest))
+        chat('Перезагрузи скрипт: /reload  или перезайди в игру.')
+        chat('Не жми обновление повторно, пока не сделаешь /reload.')
     end)
 end
 
@@ -3933,6 +3935,7 @@ local function drawScan()
     if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
         scanState.checkUpdate(true)
     end
+    imgui.TextDisabled('Файл сохраняется на диск. После обновления: /reload')
     imgui.TextDisabled('github.com/andergr0ynd/autoabarz')
     imgui.TextDisabled('/abupdate — проверить вручную')
 end
@@ -4222,6 +4225,11 @@ imgui.OnInitialize(function()
 end)
 
 imgui.OnFrame(function()
+    if scanState.forceCloseUi then
+        win[0] = false
+        chatOn[0] = false
+        return false
+    end
     return win[0] or chatOn[0]
 end, function(player)
     -- меню ABarz — курсор; один чат — камера свободна, бинд мыши включает курсор
