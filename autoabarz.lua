@@ -4076,7 +4076,7 @@ local function drawSidebar()
             setChatEnabled(not chatOn[0])
         end
         imgui.SetCursorPos(imgui.ImVec2(18, WIN_H - 40))
-        imgui.TextDisabled('/abarz  закрыть | /abprice [Название]')
+        imgui.TextDisabled('/abarz | /abprice')
     imgui.EndChild()
 end
 
