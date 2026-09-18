@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.72')
+script_version('1.6.73')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -3914,8 +3914,6 @@ local function drawScan()
     if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
         scanState.checkUpdate(true)
     end
-    imgui.TextDisabled('При входе само не качает. После обновления: /reload')
-    imgui.TextDisabled('github.com/andergr0ynd/autoabarz')
     imgui.TextDisabled('/abupdate — проверить вручную')
 end
 
