@@ -1,13 +1,11 @@
 --[[
-    AutoABarz — тот же ABarz + автообновление с GitHub.
     /abarz  /abscan  /carprice  /abchat  /abupdate
     Репозиторий: github.com/andergr0ynd/autoabarz  (ветка main)
-    На GitHub заливай: autoabarz.lua + version.json. Не клади abarz.lua рядом в moonloader.
 ]]
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.64')
+script_version('1.6.65')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -61,7 +59,7 @@ local function is_valid_utf8(s)
     return true
 end
 
--- UTF-8 не трогаем; CP1251 → UTF-8
+-- UTF-8 не трогаем; CP1251 -> UTF-8
 local function ensure_utf8(text)
     if text == nil then return '' end
     text = tostring(text)
@@ -113,16 +111,12 @@ local function ensureDir(path)
     if not doesDirectoryExist(path) then createDirectory(path) end
 end
 
--- MoonLoader CJSON падает на [] («T_ARR_END at character 3») и может убить корутину
+-- Корневой массив ([] / [{...}]) в decodeJson не отдаём: MoonLoader 0.26.5 cjson AV, pcall не ловит
 local function safeDecodeJson(raw)
-    if type(raw) ~= 'string' then return false, nil end
+    if type(raw) ~= 'string' or type(decodeJson) ~= 'function' then return false, nil end
     local s = raw:gsub('^%s+', ''):gsub('%s+$', '')
     if s == '' or s == 'null' then return false, nil end
-    local first = s:sub(1, 1)
-    if first ~= '{' and first ~= '[' then return false, nil end
-    if first == '[' and s:match('^%[%s*%]') then
-        return true, {}
-    end
+    if s:sub(1, 1) ~= '{' then return false, nil end
     local ok, data = pcall(decodeJson, s)
     if not ok or data == nil then return false, nil end
     return true, data
@@ -137,7 +131,7 @@ local incomingChat = {}
 local incomingDlg = {}
 local incomingCef = {}
 local pendingBuy = { active = false, model = '', price = 0, t = 0, source = '' }
-local pendingSell = { active = false, model = '', price = 0, t = 0, at = 0, source = '', muteNtfy = 0 }
+local pendingSell = { lots = {}, max = 2, draftModel = '', muteNtfy = 0, awaitSell = 0 }
 local needBuySnapshot = false
 local needSellSnapshot = false
 ensureDir(DATA_DIR)
@@ -175,6 +169,7 @@ local scanState = {
     mouseVk = 0x12,
     bindWait = nil,
     httpJobs = {},
+    wantScan = false,
 }
 
 scanState.menuBindOn = new.bool(true)
@@ -578,31 +573,51 @@ local function saveDealLogs()
     ensureDir(DATA_DIR)
     local f = io.open(LOGS_FILE, 'w')
     if not f then return end
-    local listed
-    if pendingSell.active and tonumber(pendingSell.price) and pendingSell.price > 0 then
-        listed = {
-            model = tostring(pendingSell.model or ''),
-            price = pendingSell.price,
-            at = tonumber(pendingSell.at) or os.time(),
-            source = tostring(pendingSell.source or ''),
-        }
+    local listed = {}
+    for i = 1, #(pendingSell.lots or {}) do
+        local lot = pendingSell.lots[i]
+        if type(lot) == 'table' and tonumber(lot.price) and lot.price > 0 then
+            listed[#listed + 1] = {
+                model = tostring(lot.model or ''),
+                price = lot.price,
+                at = tonumber(lot.at) or os.time(),
+                source = tostring(lot.source or ''),
+            }
+        end
     end
-    f:write(encodeJson({ version = 2, deals = dealLogs, listed = listed, saved_at = os.time() }))
+    f:write(encodeJson({ version = 3, deals = dealLogs, listed = listed, saved_at = os.time() }))
     f:close()
 end
 
 local function forgetListed()
-    pendingSell.active = false
-    pendingSell.model = ''
-    pendingSell.price = 0
-    pendingSell.at = 0
-    pendingSell.source = ''
+    pendingSell.lots = {}
     pendingSell.dropListed = false
+    pendingSell.awaitSell = 0
+    pendingSell.draftModel = ''
     saveDealLogs()
+end
+
+local function ingestListedRow(row)
+    if type(row) ~= 'table' then return end
+    local price = tonumber(row.price) or 0
+    local at = tonumber(row.at) or 0
+    if price <= 0 or at <= 0 or (os.time() - at) >= 43200 then return end
+    pendingSell.lots = pendingSell.lots or {}
+    pendingSell.lots[#pendingSell.lots + 1] = {
+        model = tostring(row.model or ''),
+        price = price,
+        source = tostring(row.source or 'saved'),
+        at = at,
+        t = os.clock(),
+    }
+    while #pendingSell.lots > (pendingSell.max or 2) do
+        table.remove(pendingSell.lots, 1)
+    end
 end
 
 local function loadDealLogs(keepListed)
     dealLogs = {}
+    pendingSell.lots = {}
     if not doesFileExist(LOGS_FILE) then
         pendingSell.muteNtfy = os.clock() + 12
         return
@@ -630,15 +645,10 @@ local function loadDealLogs(keepListed)
     if keepListed then
         local listed = data.listed
         if type(listed) == 'table' then
-            local price = tonumber(listed.price) or 0
-            local at = tonumber(listed.at) or 0
-            if price > 0 and at > 0 and (os.time() - at) < 43200 then
-                pendingSell.active = true
-                pendingSell.model = tostring(listed.model or '')
-                pendingSell.price = price
-                pendingSell.source = tostring(listed.source or 'saved')
-                pendingSell.at = at
-                pendingSell.t = os.clock()
+            if listed[1] then
+                for i = 1, #listed do ingestListedRow(listed[i]) end
+            else
+                ingestListedRow(listed)
             end
         end
     end
@@ -1258,6 +1268,10 @@ local function carHasToday(name)
     return false
 end
 
+local function requestScan()
+    scanState.wantScan = true
+end
+
 local function startScan()
     if scanState.active then
         chat('Скан уже идёт...')
@@ -1467,7 +1481,7 @@ end
 local function pumpScanFab()
     if scanFab.cmd == 'start' then
         scanFab.cmd = ''
-        if not scanState.active then startScan() end
+        if not scanState.active then requestScan() end
     end
     if not priceMenuOpen() then
         if scanFab.wasOpen then
@@ -1517,7 +1531,7 @@ pcall(function()
 end)
 
 ---------------------------------------------------------------------------
--- Новые продажи на АБ → чат. Из RPC только строки/числа, обработка в main.
+-- Новые продажи на АБ -> чат. Из RPC только строки/числа, обработка в main.
 ---------------------------------------------------------------------------
 local PLATES = {}
 local incomingPlates = {}
@@ -1528,7 +1542,7 @@ local function parseAbbrevPrice(str)
     if not str then return nil end
     local s = tostring(str):gsub('{%x+}', ''):gsub('{......}', ''):gsub('<[^>]+>', '')
     s = s:gsub('[%s%$]', ''):gsub('\160', ''):gsub('\194\160', '')
-    -- иконка валюты Arizona (🰢 и т.п.) + «75.000.000»
+    -- иконка валюты Arizona (? и т.п.) + «75.000.000»
     local i1, i2, numStr = s:find('(%d[%d%.,]*)')
     if not numStr then return cleanPriceNum(s) end
     local n = cleanPriceNum(numStr)
@@ -1752,6 +1766,90 @@ local function isGenericCarName(name)
         or name == 'свой транспорт' or name == 'транспортное средство'
 end
 
+function pendingSell.isActive()
+    return type(pendingSell.lots) == 'table' and #pendingSell.lots > 0
+end
+
+function pendingSell.findLot(model, price)
+    model = normalizeName(model or '')
+    price = tonumber(price) or 0
+    local byModel
+    for i = 1, #(pendingSell.lots or {}) do
+        local lot = pendingSell.lots[i]
+        local sameModel = model ~= '' and not isGenericCarName(model)
+            and normalizeName(lot.model) == model
+        local samePrice = price > 0 and lot.price == price
+        if sameModel and samePrice then return i, lot end
+        if sameModel and not byModel then byModel = i end
+    end
+    if byModel then return byModel, pendingSell.lots[byModel] end
+    if price > 0 then
+        for i = 1, #pendingSell.lots do
+            if pendingSell.lots[i].price == price then
+                return i, pendingSell.lots[i]
+            end
+        end
+    end
+    if #pendingSell.lots == 1 then return 1, pendingSell.lots[1] end
+    return nil
+end
+
+function pendingSell.addLot(model, price, source)
+    price = tonumber(price) or 0
+    if price <= 0 then return false end
+    model = normalizeName(model or pendingSell.draftModel or '')
+    if isGenericCarName(model) then model = '' end
+    pendingSell.lots = pendingSell.lots or {}
+    for i = 1, #pendingSell.lots do
+        local lot = pendingSell.lots[i]
+        local sameCar = lot.price == price and (
+            isGenericCarName(lot.model) or model == '' or normalizeName(lot.model) == model
+        )
+        if sameCar then
+            if model ~= '' then lot.model = model end
+            lot.t = os.clock()
+            lot.at = os.time()
+            lot.source = source or lot.source
+            saveDealLogs()
+            return true
+        end
+    end
+    while #pendingSell.lots >= (pendingSell.max or 2) do
+        table.remove(pendingSell.lots, 1)
+    end
+    pendingSell.lots[#pendingSell.lots + 1] = {
+        model = model,
+        price = price,
+        t = os.clock(),
+        at = os.time(),
+        source = tostring(source or 'chat'),
+    }
+    saveDealLogs()
+    return true
+end
+
+function pendingSell.removeLot(idx)
+    idx = tonumber(idx)
+    if not idx or not pendingSell.lots or not pendingSell.lots[idx] then return nil end
+    local lot = table.remove(pendingSell.lots, idx)
+    saveDealLogs()
+    return lot
+end
+
+function pendingSell.isOwn(model, price)
+    price = tonumber(price)
+    model = normalizeName(model or '')
+    for i = 1, #(pendingSell.lots or {}) do
+        local lot = pendingSell.lots[i]
+        if price and lot.price == price then
+            if isGenericCarName(lot.model) or lot.model == model or model == '' then
+                return true, i, lot
+            end
+        end
+    end
+    return false
+end
+
 local function snapshotBuyFromPlate()
     local p = nearestPlate(25) or lastFreshPlate(25)
     if not p then return end
@@ -1770,28 +1868,35 @@ local function snapshotBuyFromPlate()
 end
 
 local function snapshotSellFromPlate()
-    if not pendingSell.active then return end
-    local want = tonumber(pendingSell.price) or 0
-    if want <= 0 then return end
+    if not pendingSell.isActive() then return end
     local now = os.clock()
     local px, py, pz = playerPos()
-    local p
-    for _, row in pairs(knownPlates) do
-        if row.price == want and (now - (row.t or 0)) <= 45 then
-            local okd = true
-            if px and row.x and row.y and row.z then
-                local d = dist3(px, py, pz, row.x, row.y, row.z)
-                okd = d and d <= 12
+    local changed = false
+    for i = 1, #pendingSell.lots do
+        local lot = pendingSell.lots[i]
+        if isGenericCarName(lot.model) then
+            local want = tonumber(lot.price) or 0
+            if want > 0 then
+                local p
+                for _, row in pairs(knownPlates) do
+                    if row.price == want and (now - (row.t or 0)) <= 45 then
+                        local okd = true
+                        if px and row.x and row.y and row.z then
+                            local d = dist3(px, py, pz, row.x, row.y, row.z)
+                            okd = d and d <= 12
+                        end
+                        if okd and (not p or row.t > p.t) then p = row end
+                    end
+                end
+                if p and not isGenericCarName(p.model) then
+                    lot.model = p.model
+                    lot.source = 'plate'
+                    changed = true
+                end
             end
-            if okd and (not p or row.t > p.t) then p = row end
         end
     end
-    if not p then return end
-    if isGenericCarName(pendingSell.model) then
-        pendingSell.model = p.model
-        pendingSell.source = 'plate'
-        saveDealLogs()
-    end
+    if changed then saveDealLogs() end
 end
 
 local function addDeal(action, model, price, source)
@@ -1862,7 +1967,7 @@ local function noteDealDialog(title, text)
     if title:find('Продажа', 1, true) or title:find('Аукцион', 1, true) or title:find('продажу', 1, true) then
         local model = text:match('Транспорт:%s*([^\r\n]+)') or text:match('Модель:%s*([^\r\n]+)')
         if model then
-            pendingSell.model = normalizeName((model:gsub('%s*%[%d+%]$', '')))
+            pendingSell.draftModel = normalizeName((model:gsub('%s*%[%d+%]$', '')))
         end
     end
 end
@@ -1910,32 +2015,30 @@ local function processDealChat(raw)
         or clean:find('На продажу выставлен', 1, true)
     if listed_price and clean:find('выставили', 1, true) and not otherPlayer then
         local listed_model = clean:match('выставили%s+(.-)%s+на продажу')
-        pendingSell.active = true
-        pendingSell.t = os.clock()
-        pendingSell.at = os.time()
-        pendingSell.source = 'chat'
         local price = parseAbbrevPrice(listed_price)
-        if price and price > 0 then pendingSell.price = price end
-        if listed_model and not isGenericCarName(listed_model) then
-            pendingSell.model = normalizeName(listed_model)
-        else
+        local model = listed_model
+        if not model or isGenericCarName(model) then
+            model = pendingSell.draftModel
             needSellSnapshot = true
         end
-        saveDealLogs()
+        if price and price > 0 then
+            pendingSell.addLot(model, price, 'chat')
+            pendingSell.draftModel = ''
+        end
     end
 
     if clean:find('Поздравляем с продажей транспортного средства', 1, true) then
-        if pendingSell.active and pendingSell.price and pendingSell.price > 0
-            and (os.time() - (pendingSell.at or 0)) < 43200 then
-            snapshotSellFromPlate()
-            addDeal('sell', pendingSell.model, pendingSell.price, pendingSell.source)
+        snapshotSellFromPlate()
+        if #pendingSell.lots == 1 then
+            local lot = pendingSell.lots[1]
+            if lot.price and lot.price > 0 and (os.time() - (lot.at or 0)) < 43200 then
+                addDeal('sell', lot.model, lot.price, lot.source)
+            end
+            pendingSell.removeLot(1)
+        elseif #pendingSell.lots >= 2 then
+            pendingSell.awaitSell = os.clock()
         end
-        pendingSell.active = false
-        pendingSell.model = ''
-        pendingSell.price = 0
-        pendingSell.at = 0
         needSellSnapshot = false
-        saveDealLogs()
         return
     end
 
@@ -1943,11 +2046,6 @@ local function processDealChat(raw)
     if state_price then
         local price = parseAbbrevPrice(state_price)
         if price then addDeal('sell', 'Слив в гос', price, 'chat') end
-        pendingSell.active = false
-        pendingSell.model = ''
-        pendingSell.price = 0
-        pendingSell.at = 0
-        saveDealLogs()
         return
     end
 
@@ -1966,11 +2064,9 @@ local function processDealChat(raw)
     if sold_model and sold_price then
         local price = parseAbbrevPrice(sold_price)
         if price then addDeal('sell', sold_model, price, 'chat') end
-        pendingSell.active = false
-        pendingSell.model = ''
-        pendingSell.price = 0
-        pendingSell.at = 0
-        saveDealLogs()
+        pendingSell.awaitSell = 0
+        local idx = pendingSell.findLot(sold_model, price)
+        if idx then pendingSell.removeLot(idx) end
     end
 end
 
@@ -1994,15 +2090,16 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     end
     rememberPlate(key, model, price, x, y, z)
 
-    if pendingSell.active and price and pendingSell.price and price == pendingSell.price then
+    local own, ownIdx, ownLot = pendingSell.isOwn(model, price)
+    if own and ownLot and isGenericCarName(ownLot.model) then
         local dist
         if x and y and z then
             local px, py, pz = playerPos()
             if px then dist = dist3(px, py, pz, x, y, z) end
         end
-        if (not dist or dist <= 8) and isGenericCarName(pendingSell.model) then
-            pendingSell.model = model
-            pendingSell.source = 'plate'
+        if not dist or dist <= 8 then
+            ownLot.model = model
+            ownLot.source = 'plate'
             saveDealLogs()
         end
     end
@@ -2010,9 +2107,6 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     local token = (kind == 'auction') and ('AUC/' .. model) or ('%s/%s'):format(model, tostring(price))
     if PLATES[key] == token then return end
     PLATES[key] = token
-
-    local own = pendingSell.active and pendingSell.price == price
-        and (isGenericCarName(pendingSell.model) or pendingSell.model == model)
     if notifyNewSales[0] and not own and os.clock() > (pendingSell.muteNtfy or 0) then
         pcall(notifyNewSale, kind, model, price)
     end
@@ -2052,21 +2146,31 @@ local function pumpSales()
     if not saleAlive then return end
 
     if pendingSell.dropListed then
-        local had = pendingSell.active
+        local had = pendingSell.isActive()
         pendingSell.dropListed = false
         forgetListed()
         if had then
-            chat('Лот на АБ сброшен: кик/дисконнект — выставьте машину заново')
+            chat('Лоты на АБ сброшены: кик/дисконнект — выставьте машины заново')
         end
     end
     pcall(function()
-        if type(sampGetGamestate) == 'function' and pendingSell.active then
+        if type(sampGetGamestate) == 'function' and pendingSell.isActive() then
             local gs = sampGetGamestate()
             if type(gs) == 'number' and gs < 3 then
                 pendingSell.dropListed = true
             end
         end
     end)
+
+    if pendingSell.awaitSell and pendingSell.awaitSell > 0
+        and (os.clock() - pendingSell.awaitSell) > 2.5 then
+        local lot = pendingSell.lots[1]
+        if lot and tonumber(lot.price) and lot.price > 0 then
+            addDeal('sell', lot.model, lot.price, lot.source)
+        end
+        pendingSell.removeLot(1)
+        pendingSell.awaitSell = 0
+    end
 
     if needBuySnapshot then
         pcall(snapshotBuyFromPlate)
@@ -2096,9 +2200,15 @@ local function pumpSales()
 
     if needSellSnapshot then
         pcall(snapshotSellFromPlate)
-        if not isGenericCarName(pendingSell.model) or (os.clock() - (pendingSell.t or 0)) > 8 then
-            needSellSnapshot = false
+        local still = false
+        for i = 1, #(pendingSell.lots or {}) do
+            local lot = pendingSell.lots[i]
+            if isGenericCarName(lot.model) and (os.clock() - (lot.t or 0)) <= 8 then
+                still = true
+                break
+            end
         end
+        if not still then needSellSnapshot = false end
     end
 end
 
@@ -2384,37 +2494,27 @@ end
 
 local function ingestAbCefPacket(packet)
     if not packet then return end
-    if type(packet.json) ~= 'table' and type(packet.jsonText) == 'string' and packet.jsonText ~= '' then
-        local ok, copy = safeDecodeJson(packet.jsonText)
+    local jsonText0 = tostring(packet.jsonText or '')
+    local evName = tostring(packet.event or '')
+    local rawText = tostring(packet.text or '')
+    if evName:find('inventory', 1, true) or evName:find('storage', 1, true) then return end
+    if rawText:find('playerInventory', 1, true) or rawText:find('event.storage', 1, true) then return end
+    local jsonLead = jsonText0:gsub('^%s+', ''):sub(1, 1)
+    if jsonLead == '[' then return end
+    if jsonLead == '{' and type(packet.json) ~= 'table' then
+        local ok, copy = safeDecodeJson(jsonText0)
         if ok then packet.json = copy end
-    end
-    if type(packet.json) ~= 'table' and type(packet.text) == 'string' and arz and arz.decode then
-        local t = tostring(packet.text):gsub('^%s+', ''):gsub('%s+$', '')
-        if t ~= '' and t ~= '[]' and t ~= '{}' then
-            pcall(function()
-                local fake = { id = 17, text = packet.text }
-                arz.decode(fake)
-                if fake.json then packet.json = fake.json end
-                if type(fake.event) == 'string' and fake.event ~= '' then
-                    packet.event = fake.event
-                end
-            end)
-        end
     end
     pcall(noteVehiclePassport, packet)
     if not scanState.active then return end
-    local text = tostring(packet.text or '')
-    local event = tostring(packet.event or '')
-    local jsonText = tostring(packet.jsonText or '')
+    local jsonText = jsonText0
     if jsonText == '' and type(packet.json) == 'string' then
-        jsonText = packet.json
-    elseif jsonText == '' and type(packet.json) == 'table' then
-        local okj, encoded = pcall(encodeJson, packet.json)
-        if okj then jsonText = encoded end
+        local lead = packet.json:gsub('^%s+', ''):sub(1, 1)
+        if lead == '{' then jsonText = packet.json end
     end
-    if isAbCefText(text, event) or isAbCefText(jsonText, event) then
-        if text ~= '' then ingestTextBlob(text) end
-        if jsonText ~= '' and jsonText ~= text then ingestTextBlob(jsonText) end
+    if isAbCefText(rawText, evName) or isAbCefText(jsonText, evName) then
+        if rawText ~= '' then ingestTextBlob(rawText) end
+        if jsonText ~= '' and jsonText ~= rawText then ingestTextBlob(jsonText) end
     end
 end
 
@@ -2428,16 +2528,31 @@ local function queueCefSnap(packet)
         if type(e) == 'string' then snap.event = e .. '' end
         snap.server_id = tonumber(packet.server_id) or 0
         local j = packet.json
-        if type(j) == 'string' and #j < 8000 then snap.jsonText = j .. '' end
+        if type(j) == 'string' and #j < 8000 and j:gsub('^%s+', ''):sub(1, 1) == '{' then
+            snap.jsonText = j .. ''
+        end
     end)
     if snap.event == '' and snap.text ~= '' then
         local ev = snap.text:match("executeEvent%('([^']+)'")
         if ev then snap.event = ev .. '' end
         if snap.jsonText == '' then
             local js = snap.text:match("executeEvent%('[^']+',%s*`([^`]*)`%)")
-            if js and #js < 8000 then snap.jsonText = js end
+            if js and #js < 8000 and js:gsub('^%s+', ''):sub(1, 1) == '{' then
+                snap.jsonText = js
+            end
         end
     end
+    local evl, txt = snap.event, snap.text
+    if evl:find('inventory', 1, true) or evl:find('storage', 1, true) then return end
+    if txt:find('playerInventory', 1, true) or txt:find('event.storage', 1, true) then return end
+    local keep = isAbCefText(txt, evl)
+        or evl:find('dialog', 1, true)
+        or evl:find('document', 1, true)
+        or evl:find('passport', 1, true)
+        or txt:find('Технический паспорт', 1, true)
+        or txt:find('технический паспорт', 1, true)
+        or txt:find('Средняя цена', 1, true)
+    if not keep then return end
     if snap.text == '' and snap.jsonText == '' then return end
     incomingCef[#incomingCef + 1] = snap
     if #incomingCef > 24 then table.remove(incomingCef, 1) end
@@ -2817,22 +2932,9 @@ scanState.pumpHttpJobs = function()
     scanState.httpJobs = rest
 end
 
-scanState.verNewer = function(remote, localv)
-    local function parts(v)
-        local t, s = {}, tostring(v or ''):lower():gsub('^v', '')
-        for n in s:gmatch('%d+') do t[#t + 1] = tonumber(n) or 0 end
-        return t
-    end
-    local a, b = parts(localv), parts(remote)
-    if #a == 0 or #b == 0 then return false end
-    local n = math.max(#a, #b)
-    for i = 1, n do
-        local x, y = a[i] or 0, b[i] or 0
-        if y > x then return true end
-        if y < x then return false end
-    end
-    return false
-end
+-- Автообновление как в FHelper: version.json (latest, updateurl) + downloadUrlToFile + reload
+local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/version.json'
+local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/autoabarz.lua'
 
 scanState.isHtmlHead = function(s)
     s = tostring(s or ''):gsub('^%s+', ''):sub(1, 96):lower()
@@ -2847,113 +2949,29 @@ scanState.readAll = function(path)
     return s
 end
 
-scanState.ghMirrors = function(name)
-    name = tostring(name or 'autoabarz.lua')
-    return {
-        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/' .. name,
-        'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/' .. name,
-        'https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/' .. name,
-    }
-end
-
--- Скачивание как в autozatochka: downloadUrlToFile + requests, только из lua_thread.
-scanState.dlMoon = function(url, path, timeout)
+scanState.dlTo = function(url, path, timeout)
     if type(downloadUrlToFile) ~= 'function' then return false end
     local okm, ml = pcall(require, 'moonloader')
-    if not (okm and ml and ml.download_status) then return false end
-    local d = ml.download_status
-    pcall(os.remove, path)
-    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
-    local done, success = false, false
+    local d = okm and ml and ml.download_status
+    if not d then return false end
+    if doesFileExist(path) then pcall(os.remove, path) end
+    local bust = tostring(url) .. (tostring(url):find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local done = false
     downloadUrlToFile(bust, path, function(_, status)
         if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
-            done, success = true, true
+            done = true
         end
     end)
     local t0 = os.clock()
-    timeout = tonumber(timeout) or 45
+    timeout = tonumber(timeout) or 12
     while not done and os.clock() - t0 < timeout do
-        wait(50)
+        wait(100)
     end
-    if not success or not doesFileExist(path) then return false end
     wait(150)
+    if not doesFileExist(path) then return false end
     local body = scanState.readAll(path)
-    return type(body) == 'string' and #body >= 8 and not scanState.isHtmlHead(body)
-end
-
-scanState.dlReq = function(url, path, timeout)
-    local ok_req, requests = pcall(require, 'requests')
-    if not (ok_req and requests and requests.get) then return false end
-    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
-    local ok, resp = pcall(requests.get, bust, {
-        timeout = timeout or 30,
-        allow_redirects = true,
-        headers = { ['User-Agent'] = 'Mozilla/5.0 AutoABarz/1.6' },
-    })
-    if not ok or not resp or type(resp.text) ~= 'string' or #resp.text < 8 then return false end
-    if resp.status_code and resp.status_code >= 400 then return false end
-    if scanState.isHtmlHead(resp.text) then return false end
-    local f = io.open(path, 'wb')
-    if not f then return false end
-    f:write(resp.text)
-    f:close()
-    return true
-end
-
-scanState.dlMirrors = function(name, path, timeout)
-    local urls = scanState.ghMirrors(name)
-    for i = 1, #urls do
-        if scanState.dlMoon(urls[i], path, timeout) then return true end
-        if scanState.dlReq(urls[i], path, timeout) then return true end
-    end
-    return false
-end
-
-scanState.githubGet = function(file, timeout, cb)
-    file = tostring(file or 'autoabarz.lua')
-    local name = file:find('version.json', 1, true) and 'version.json' or 'autoabarz.lua'
-    lua_thread.create(function()
-        local path = DATA_DIR .. '\\upd_' .. name
-        pcall(ensureDir, DATA_DIR)
-        local ok = scanState.dlMirrors(name, path, timeout or 30)
-        local body = ok and scanState.readAll(path) or nil
-        pcall(os.remove, path)
-        if type(cb) == 'function' then
-            if type(body) == 'string' then cb(body, nil, 200) else cb(nil, 'download failed', 0) end
-        end
-    end)
-end
-
-scanState.applyUpdate = function(body, latest)
-    if type(body) ~= 'string' or #body < 4000 then return false, 'файл короткий' end
-    if scanState.isHtmlHead(body) then
-        return false, 'пришла страница, не lua'
-    end
-    if not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
-        return false, 'это не скрипт'
-    end
-    local path = thisScript().path
-    if type(path) ~= 'string' or path == '' then return false, 'нет пути скрипта' end
-    local bak = path .. '.bak'
-    pcall(function()
-        local old = io.open(path, 'rb')
-        if old then
-            local prev = old:read('*a')
-            old:close()
-            local b = io.open(bak, 'wb')
-            if b then b:write(prev) b:close() end
-        end
-    end)
-    local f = io.open(path, 'wb')
-    if not f then return false, 'не записалось' end
-    f:write(body)
-    f:close()
-    chat(('Обновлён до %s. Перезагрузка…'):format(tostring(latest or '')))
-    lua_thread.create(function()
-        wait(400)
-        pcall(function() thisScript():reload() end)
-    end)
-    return true
+    if type(body) ~= 'string' or #body < 8 or scanState.isHtmlHead(body) then return false end
+    return true, body
 end
 
 scanState.checkUpdate = function(manual)
@@ -2962,37 +2980,91 @@ scanState.checkUpdate = function(manual)
         return
     end
     scanState.updateBusy = true
-    local cur = tostring(thisScript().version or '0')
-    if manual then chat('Проверяю GitHub…') end
-    scanState.githubGet('version.json', 20, function(res, err, code)
-        if type(res) ~= 'string' or res == '' then
+    lua_thread.create(function()
+        if manual then chat('Проверяю GitHub…') end
+        pcall(ensureDir, DATA_DIR)
+        local tmp = DATA_DIR .. '\\upd_version.json'
+        local jsonUrls = {
+            UPDATE_JSON,
+            'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/version.json',
+        }
+        local ok, raw
+        for i = 1, #jsonUrls do
+            ok, raw = scanState.dlTo(jsonUrls[i], tmp, 12)
+            if ok then break end
+        end
+        pcall(os.remove, tmp)
+        if not ok or type(raw) ~= 'string' then
             scanState.updateBusy = false
-            if manual then chat('GitHub недоступен' .. (err and (': ' .. tostring(err)) or '')) end
+            if manual then chat('GitHub недоступен') end
             return
         end
-        local ok, data = safeDecodeJson(res)
-        local latest = ok and type(data) == 'table' and tostring(data.latest or data.version or '')
+        local okj, meta = safeDecodeJson(raw)
+        local latest = okj and type(meta) == 'table' and tostring(meta.latest or '')
+        local updateurl = okj and type(meta) == 'table' and tostring(meta.updateurl or '')
         if not latest or latest == '' then
             scanState.updateBusy = false
             if manual then chat('Не прочитался version.json') end
             return
         end
-        if not scanState.verNewer(latest, cur) then
+        local cur = tostring(thisScript().version or '0')
+        if latest == cur then
             scanState.updateBusy = false
             if manual then chat(('Уже актуальная версия %s'):format(cur)) end
             return
         end
-        chat(('Есть обновление: %s → %s'):format(cur, latest))
-        scanState.githubGet('autoabarz.lua', 60, function(body, err2)
-            if type(body) ~= 'string' then
-                scanState.updateBusy = false
-                chat('Не скачался скрипт' .. (err2 and (': ' .. tostring(err2)) or ''))
-                return
-            end
-            local done, why = scanState.applyUpdate(body, latest)
+        if updateurl == '' or not updateurl:find('^https?://') then
+            updateurl = UPDATE_LUA
+        end
+        chat(('Есть обновление: %s -> %s'):format(cur, latest))
+        wait(250)
+        local tmpLua = DATA_DIR .. '\\upd_autoabarz.lua'
+        local luaUrls = {
+            updateurl,
+            UPDATE_LUA,
+            'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/autoabarz.lua',
+        }
+        local okLua, body
+        for i = 1, #luaUrls do
+            okLua, body = scanState.dlTo(luaUrls[i], tmpLua, 45)
+            if okLua and type(body) == 'string' and #body >= 4000 then break end
+            okLua, body = false, nil
+        end
+        pcall(os.remove, tmpLua)
+        if not okLua or type(body) ~= 'string' or #body < 4000
+            or not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
             scanState.updateBusy = false
-            if not done then chat('Обновление не применилось: ' .. tostring(why or '')) end
+            chat('Обновление прошло неудачно. Запускаю текущую версию.')
+            return
+        end
+        local path = thisScript().path
+        if type(path) ~= 'string' or path == '' then
+            scanState.updateBusy = false
+            chat('Нет пути скрипта')
+            return
+        end
+        local bak = path .. '.bak'
+        pcall(function()
+            local old = io.open(path, 'rb')
+            if old then
+                local prev = old:read('*a')
+                old:close()
+                local b = io.open(bak, 'wb')
+                if b then b:write(prev) b:close() end
+            end
         end)
+        local f = io.open(path, 'wb')
+        if not f then
+            scanState.updateBusy = false
+            chat('Не записалось обновление')
+            return
+        end
+        f:write(body)
+        f:close()
+        chat(('Обновлён до %s. Перезагрузка…'):format(latest))
+        wait(500)
+        scanState.updateBusy = false
+        pcall(function() thisScript():reload() end)
     end)
 end
 
@@ -3556,9 +3628,18 @@ end
 
 local function setupUi()
 local searchBuf = new.char[64]()
+local dealModelBuf = new.char[64]()
+local dealSearchBuf = new.char[64]()
+local dealPriceBuf = new.char[32]()
+local function setCString(buf, cap, s)
+    s = tostring(s or '')
+    if #s >= cap then s = s:sub(1, cap - 1) end
+    ffi.fill(buf, cap, 0)
+    if s ~= '' then ffi.copy(buf, s) end
+end
 local filter = ''
 local page = 1
-local WIN_W, WIN_H, SIDEBAR = 760, 520, 168
+local WIN_W, WIN_H, SIDEBAR = 760, 560, 168
 local CHAT_W, CHAT_H = 380, 470
 local accentCol = { 0.36, 0.58, 1.0 }
 local PAGES = {
@@ -3597,9 +3678,9 @@ local function applyStyle()
     s.ScrollbarSize = 8
     s.GrabMinSize = 10
     local c = s.Colors
-    c[imgui.Col.Text] = imgui.ImVec4(0.91, 0.92, 0.94, 1)
-    c[imgui.Col.TextDisabled] = imgui.ImVec4(0.55, 0.57, 0.63, 1)
-    c[imgui.Col.WindowBg] = imgui.ImVec4(0.055, 0.06, 0.08, 0.96)
+    c[imgui.Col.Text] = imgui.ImVec4(0.94, 0.95, 0.97, 1)
+    c[imgui.Col.TextDisabled] = imgui.ImVec4(0.54, 0.57, 0.63, 1)
+    c[imgui.Col.WindowBg] = imgui.ImVec4(0.047, 0.055, 0.078, 0.97)
     c[imgui.Col.ChildBg] = imgui.ImVec4(0.07, 0.08, 0.11, 0.55)
     c[imgui.Col.PopupBg] = imgui.ImVec4(0.09, 0.10, 0.13, 0.98)
     c[imgui.Col.Border] = imgui.ImVec4(1, 1, 1, 0.06)
@@ -3796,7 +3877,7 @@ local function drawScan()
             ('Идёт скан: стр. %d  %s'):format(scanState.index, tostring(scanState.currentName or '')))
     end
     spaced(0, 6)
-    if actionButton('Сканировать', imgui.ImVec2(150, 34)) then startScan() end
+    if actionButton('Сканировать', imgui.ImVec2(150, 34)) then requestScan() end
     imgui.SameLine()
     if actionButton('Стоп', imgui.ImVec2(90, 34)) then stopScan() end
     imgui.SameLine()
@@ -3865,23 +3946,96 @@ local function drawDeals()
     imgui.SameLine()
     metric('Получено', fmtMoney(earned), 170)
     spaced(0, 6)
-    if pendingSell.active and (tonumber(pendingSell.price) or 0) > 0 then
-        imgui.TextColored(imgui.ImVec4(0.55, 0.85, 0.65, 1),
-            ('На АБ: %s  ·  %s'):format(
-                (pendingSell.model ~= '' and pendingSell.model) or 'транспорт',
-                fmtMoney(pendingSell.price)))
+    local nLots = #(pendingSell.lots or {})
+    if nLots > 0 then
+        imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
+            ('На АБ  %d/2'):format(nLots))
+        for i = 1, nLots do
+            local lot = pendingSell.lots[i]
+            imgui.Text(('  %s  ·  %s'):format(
+                (lot.model ~= '' and lot.model) or 'транспорт',
+                fmtMoney(lot.price)))
+            imgui.SameLine(320)
+            if imgui.SmallButton('снять##' .. i) then
+                pendingSell.removeLot(i)
+                chat('Лот убран из памяти (машина на АБ не снимается)')
+                break
+            end
+        end
     else
         imgui.TextDisabled('Сейчас на АБ ничего не выставлено (из сохранения)')
     end
+
+    spaced(0, 8)
+    sectionTitle('Добавить сделку')
+    local pickedModel = ffi.string(dealModelBuf)
+    imgui.SetNextItemWidth(280)
+    if imgui.BeginCombo('##dealmodel', pickedModel ~= '' and pickedModel or 'модель из базы') then
+        if imgui.IsWindowAppearing() then imgui.SetKeyboardFocusHere() end
+        imgui.SetNextItemWidth(-1)
+        imgui.InputTextWithHint('##dealmsearch', 'поиск по базе...', dealSearchBuf, 64)
+        local rows = findPrices(ffi.string(dealSearchBuf))
+        if #priceList == 0 then
+            imgui.TextDisabled('Сначала скан — список из средних цен')
+        elseif #rows == 0 then
+            imgui.TextDisabled('Нет совпадений')
+        else
+            for i = 1, math.min(#rows, 80) do
+                local row = rows[i]
+                local name = row.name
+                local sel = name == pickedModel
+                if imgui.Selectable(('%s  %s'):format(name, fmtMoney(row.price)), sel) then
+                    setCString(dealModelBuf, 64, name)
+                    dealSearchBuf[0] = 0
+                end
+                if sel then imgui.SetItemDefaultFocus() end
+            end
+        end
+        imgui.EndCombo()
+    end
+    imgui.SameLine()
+    imgui.SetNextItemWidth(140)
+    imgui.InputTextWithHint('##dealprice', 'цена, 12кк', dealPriceBuf, 32)
+    local function submitManual(action)
+        local model = normalizeName(ffi.string(dealModelBuf))
+        if model == '' then
+            local q = normalizeName(ffi.string(dealSearchBuf))
+            if q ~= '' then
+                local rows = findPrices(q)
+                if #rows == 1 then model = rows[1].name else model = q end
+            end
+        end
+        local priceRaw = ffi.string(dealPriceBuf)
+        local price = parseAbbrevPrice(priceRaw) or cleanPriceNum(priceRaw)
+        if model == '' then
+            chat('Выбери модель из базы')
+            return
+        end
+        if not price or price <= 0 then
+            chat('Укажи цену (можно 12кк)')
+            return
+        end
+        addDeal(action, model, price, 'manual')
+        dealModelBuf[0] = 0
+        dealSearchBuf[0] = 0
+        dealPriceBuf[0] = 0
+    end
+    if actionButton('Купил', imgui.ImVec2(110, 28)) then submitManual('buy') end
+    imgui.SameLine()
+    if actionButton('Продал', imgui.ImVec2(110, 28)) then submitManual('sell') end
+    imgui.TextDisabled('Модель — из базы средних цен. Если сделки нет в логе — внеси сюда.')
+
     spaced(0, 6)
-    imgui.BeginChild('##deals', imgui.ImVec2(-1, WIN_H - 220), true)
+    imgui.BeginChild('##deals', imgui.ImVec2(-1, WIN_H - 330), true)
         if #dealLogs == 0 then
             imgui.TextDisabled('Пока пусто')
         else
+            local removeIdx
             for i = #dealLogs, math.max(1, #dealLogs - 80), -1 do
                 local log = dealLogs[i]
                 local tag = log.action == 'buy' and 'Купил' or 'Продал'
                 local col = log.action == 'buy' and imgui.ImVec4(0.95, 0.45, 0.45, 1) or imgui.ImVec4(0.45, 0.85, 0.55, 1)
+                imgui.PushIDInt(i)
                 imgui.TextDisabled(os.date('%d.%m %H:%M', log.time or 0))
                 imgui.SameLine(90)
                 imgui.TextColored(col, tag)
@@ -3889,6 +4043,15 @@ local function drawDeals()
                 imgui.Text(tostring(log.model or ''))
                 imgui.SameLine(320)
                 imgui.TextColored(col, fmtMoney(log.price))
+                imgui.SameLine(430)
+                if imgui.SmallButton('x') then
+                    removeIdx = i
+                end
+                imgui.PopID()
+            end
+            if removeIdx then
+                table.remove(dealLogs, removeIdx)
+                saveDealLogs()
             end
         end
     imgui.EndChild()
@@ -4137,14 +4300,18 @@ function main()
     saleAlive = true
     chat(('AutoABarz загружен. /abarz — в базе: %d'):format(#priceList))
     if scanState.menuBindOn[0] then
-        chat(('Бинд меню: %s  ·  чат: %s  (Скан → Бинды)'):format(
+        chat(('Бинд меню: %s  ·  чат: %s  (Скан -> Бинды)'):format(
             scanState.keyName(scanState.menuVk),
             scanState.chatBindOn[0] and scanState.keyName(scanState.chatVk) or 'выкл'))
     end
-    if pendingSell.active and (tonumber(pendingSell.price) or 0) > 0 then
-        chat(('На АБ помню: %s за %s'):format(
-            (pendingSell.model ~= '' and pendingSell.model) or 'транспорт',
-            fmtMoney(pendingSell.price)))
+    if pendingSell.isActive() then
+        for i = 1, #pendingSell.lots do
+            local lot = pendingSell.lots[i]
+            chat(('На АБ помню %d/2: %s за %s'):format(
+                i,
+                (lot.model ~= '' and lot.model) or 'транспорт',
+                fmtMoney(lot.price)))
+        end
     end
     if not ok_arz then
         chat('Нет arizona-events (lib) — CEF будет ограничен')
@@ -4154,7 +4321,7 @@ function main()
     end
 
     sampRegisterChatCommand('abarz', function() win[0] = not win[0] end)
-    sampRegisterChatCommand('abscan', function() startScan() end)
+    sampRegisterChatCommand('abscan', function() requestScan() end)
     sampRegisterChatCommand('abchat', function()
         setChatEnabled(not chatOn[0])
     end)
@@ -4187,12 +4354,16 @@ function main()
     end)
     if scanState.autoUpdateOn[0] then
         lua_thread.create(function()
-            wait(10000)
+            wait(2500)
             scanState.checkUpdate(false)
         end)
     end
 
     while true do
+        if scanState.wantScan then
+            scanState.wantScan = false
+            startScan()
+        end
         pcall(scanState.pumpHttpJobs)
         pcall(drainHttpCbQueue)
         pcall(pumpSales)
