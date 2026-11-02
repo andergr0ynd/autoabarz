@@ -26,6 +26,6 @@
 - `images/abarz-logo.png` — логотип в левом верхнем углу меню
 - `arizona-events/` — разбор пакетов интерфейса Arizona
 
-`arizona-events` основан на [zvyk/arizona-events](https://github.com/zvyk/arizona-events). В `core.lua` и `bitstream.lua` длина строки ограничена остатком пакета, а битый пакет пропускается. Из-за этого `bad allocation` больше не роняет скрипт.
+В `core.lua` и `bitstream.lua` длина строки ограничена остатком пакета, а битый пакет пропускается. Из-за этого `bad allocation` больше не роняет скрипт.
 
 Тема на Blast: https://www.blast.hk/threads/257682/
