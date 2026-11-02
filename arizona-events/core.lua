@@ -206,15 +206,6 @@ local handlers = {
 	}
 }
 
-local faultAt = 0
-
-local function noteFault(id, err)
-	local now = os.clock()
-	if now - faultAt < 5 then return end
-	faultAt = now
-	print(("[arizona-events] packet %s skipped: %s"):format(tostring(id), tostring(err)))
-end
-
 local function process_packet(id, bs, handlers)
 	local handler = handlers[id]
 	if not handler then return end
@@ -224,14 +215,12 @@ local function process_packet(id, bs, handlers)
 	end)
 	if not ok or event == nil then
 		pcall(BitStream.setReadOffset, bs, 0)
-		if not ok then noteFault(id, event) end
 		return
 	end
 	local cb = module[event]
 	if not cb then return end
 	local okCb, result = pcall(cb, data and data[1])
 	if not okCb then
-		noteFault(id, result)
 		return
 	end
 	if result == false then

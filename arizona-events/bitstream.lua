@@ -234,7 +234,7 @@ IO.byteArray = (function()
 
 	function this.read(bs, size)
 		size = tonumber(size) or 0
-		if size < 0 or size > 4096 or size > unreadBytes(bs) then
+		if size < 0 or size > 4096 then
 			error("arizona-events: oversized array")
 		end
 		local t = {}
