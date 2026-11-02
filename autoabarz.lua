@@ -1,11 +1,11 @@
 --[[
-    /abarz  /abscan  /carprice  /abchat  /abupdate
+    /abarz  /abscan  /abprice  /abchat  /abupdate
     Репозиторий: github.com/andergr0ynd/autoabarz  (ветка main)
 ]]
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.6.73')
+script_version('1.6.76')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -23,7 +23,7 @@ if not ok_imgui then
     return
 end
 
-local ok_arz, arz = pcall(require, 'arizona-events')
+local ok_arz, arz
 local ok_cef, cefDlg = pcall(require, 'arizona-cef-dialogs')
 if not ok_cef then cefDlg = nil end
 local ok_ev, ev = pcall(require, 'samp.events')
@@ -135,6 +135,26 @@ local pendingSell = { lots = {}, max = 2, draftModel = '', muteNtfy = 0, awaitSe
 local needBuySnapshot = false
 local needSellSnapshot = false
 ensureDir(DATA_DIR)
+
+-- Превью машин в «База»: методы на таблице (не local function — лимит 200 locals).
+-- Свои картинки: config/abarz/cars/<имя>.jpg|png (пробелы → _).
+local carImg = {
+    dir = DATA_DIR .. '\\cars',
+    mapFile = DATA_DIR .. '\\vehicles.json',
+    -- Arizona CDN: .../inventory/vehicles/512/{server_id}.png
+    cdn = {
+        'https://cdn.azresources.cloud/projects/arizona-rp/assets/images/inventory/vehicles/512/',
+        'https://reserve-cdn.azresources.cloud/projects/arizona-rp/assets/images/inventory/vehicles/512/',
+    },
+    byName = {},
+    mapReady = false,
+    mapLoading = false,
+    slots = {},
+    dl = nil,
+    activeName = nil,
+    pending = nil,
+}
+ensureDir(carImg.dir)
 
 local waitPageMs = new.int(0)
 local notifyNewSales = new.bool(true)
@@ -590,12 +610,25 @@ local function saveDealLogs()
     f:close()
 end
 
+-- Arizona снимает лоты с АБ при кике/дисконнекте/переподключении.
+-- Чистим сразу в файл — иначе onScriptTerminate успевает сохранить «призраков».
 local function forgetListed()
     pendingSell.lots = {}
     pendingSell.dropListed = false
     pendingSell.awaitSell = 0
     pendingSell.draftModel = ''
     saveDealLogs()
+end
+
+local function dropListedNow(reason)
+    local had = pendingSell.isActive()
+    pendingSell.dropListed = false
+    if not had then return false end
+    forgetListed()
+    if reason and isSampAvailable() then
+        chat(reason)
+    end
+    return true
 end
 
 local function ingestListedRow(row)
@@ -620,7 +653,6 @@ local function loadDealLogs(keepListed)
     dealLogs = {}
     pendingSell.lots = {}
     if not doesFileExist(LOGS_FILE) then
-        pendingSell.muteNtfy = os.clock() + 12
         return
     end
     local f = io.open(LOGS_FILE, 'r')
@@ -653,7 +685,6 @@ local function loadDealLogs(keepListed)
             end
         end
     end
-    pendingSell.muteNtfy = os.clock() + 12
 end
 
 local function fmtMoney(n)
@@ -664,11 +695,45 @@ local function fmtMoney(n)
     return '$' .. left .. (num:reverse():gsub('(%d%d%d)', '%1.'):reverse()) .. right
 end
 
+-- Латинские буквы и похожие кириллические (С/C, О/O, …) в поиске одно и то же.
+-- В базе имя «C5 СEO»: третья буква кириллическая, с клавиатуры приходит латинская.
+local function foldName(s)
+    s = tostring(s or ''):lower()
+    local map = {
+        ['\208\144'] = 'a', ['\208\176'] = 'a',
+        ['\208\146'] = 'b', ['\208\178'] = 'b',
+        ['\208\149'] = 'e', ['\208\181'] = 'e',
+        ['\208\154'] = 'k', ['\208\186'] = 'k',
+        ['\208\156'] = 'm', ['\208\188'] = 'm',
+        ['\208\157'] = 'h', ['\208\189'] = 'h',
+        ['\208\158'] = 'o', ['\208\190'] = 'o',
+        ['\208\160'] = 'p', ['\209\128'] = 'p',
+        ['\208\161'] = 'c', ['\209\129'] = 'c',
+        ['\208\162'] = 't', ['\209\130'] = 't',
+        ['\208\163'] = 'y', ['\209\131'] = 'y',
+        ['\208\165'] = 'x', ['\209\133'] = 'x',
+        ['\208\134'] = 'i', ['\209\150'] = 'i',
+    }
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local two = s:sub(i, i + 1)
+        local rep = map[two]
+        if rep then
+            out[#out + 1] = rep
+            i = i + 2
+        else
+            out[#out + 1] = s:sub(i, i)
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
 local function findPrices(query)
-    query = tostring(query or ''):lower()
+    query = foldName(query)
     local out = {}
     for _, row in ipairs(priceList) do
-        if query == '' or row.name:lower():find(query, 1, true) then
+        if query == '' or foldName(row.name):find(query, 1, true) then
             out[#out + 1] = row
         end
     end
@@ -1573,17 +1638,209 @@ local function lookupAvgPrice(model)
     if p and p > 0 then return p end
 end
 
-local function parseSalePlate(text)
+-- Суффиксы кузова/поколения, которые сервер часто не выносит в отдельную
+-- среднюю (S600 W124 / W221 → одна «Mercedes S600» в списке АБ).
+local function stripChassisSuffix(name)
+    name = normalizeName(name)
+    if name == '' then return name end
+    -- (W124) / [W221] / (E39)
+    name = name:gsub('%s*[%(%[]%s*[WwEe]%d%d%d?%s*[%)%]]%s*$', '')
+    -- хвостовые токены: W124, W221, E39, E60, C207…
+    while true do
+        local trimmed = name:gsub('%s+[WwEe][A-Za-z]?%d%d%d?%s*$', '')
+        if trimmed == name then break end
+        name = trimmed
+    end
+    return normalizeName(name)
+end
+
+-- Кандидаты: полное имя → без шасси → укорачивание с хвоста по словам.
+local function avgNameCandidates(model)
+    model = normalizeName(model)
+    local out, seen = {}, {}
+    local function push(n)
+        n = normalizeName(n)
+        if n == '' or seen[n] then return end
+        seen[n] = true
+        out[#out + 1] = n
+    end
+    push(model)
+    push(stripChassisSuffix(model))
+    local words = {}
+    for w in model:gmatch('%S+') do words[#words + 1] = w end
+    for len = #words - 1, 1, -1 do
+        push(table.concat(words, ' ', 1, len))
+    end
+    return out
+end
+
+-- Сервер схлопывает варианты в одну среднюю → ищем лучшее совпадение в базе.
+-- Возвращает price, matchedName (имя из prices).
+local function resolveAvgForModel(model)
+    model = normalizeName(model)
+    if model == '' then return nil, model end
+
+    for _, cand in ipairs(avgNameCandidates(model)) do
+        local p = lookupAvgPrice(cand)
+        if p then return p, cand end
+    end
+
+    -- Паспорт часто пишет латинское C, а в базе та же буква кириллическая.
+    -- Совпадение: целиком, с лишним хвостом, либо имя из базы встречается внутри.
+    local modelLow = foldName(model)
+    if modelLow == '' then return nil, model end
+    local bestName, bestScore
+    for _, row in ipairs(priceList) do
+        local nLow = foldName(row.name)
+        if nLow ~= '' then
+            local score
+            if modelLow == nLow then
+                score = 1000 + #nLow
+            elseif modelLow:sub(1, #nLow + 1) == nLow .. ' '
+                or nLow:sub(1, #modelLow + 1) == modelLow .. ' ' then
+                score = 800 + math.min(#modelLow, #nLow)
+            elseif #nLow >= 4 and modelLow:find(nLow, 1, true) then
+                score = 500 + #nLow
+            elseif #modelLow >= 4 and nLow:find(modelLow, 1, true) then
+                score = 400 + #modelLow
+            end
+            if score and (not bestScore or score > bestScore) then
+                bestName, bestScore = row.name, score
+            end
+        end
+    end
+    if bestName then
+        local p = lookupAvgPrice(bestName)
+        if p then return p, bestName end
+    end
+    return nil, model
+end
+
+-- Стрелка и звук как в AB Informer: только интерьер автобазара и модель таблички.
+-- Модель стрелки держим загруженной, пока скрипт жив. Короткий разбор
+-- «имя / цена / Twin Turbo» включается лишь для этой таблички.
+scanState.mark = {
+    interior = 15,
+    abModel = 15256,
+    sound = 1052,
+    arrowModel = 19605,
+    duration = 8000,
+    height = 1.2,
+    scale = 1.0,
+    rotSpeed = 18,
+    object = nil,
+    expires = 0,
+    modelReady = false,
+    pendingShort = {},
+}
+
+function scanState.mark.turboOf(text)
+    local low = tostring(text or ''):lower()
+    if low:find('twin turbo', 1, true) or low:find('twinturbo', 1, true) then
+        return 'Twin Turbo'
+    end
+    return 'No TT'
+end
+
+function scanState.mark.clean(text)
     text = tostring(text or ''):gsub('{%x+}', ''):gsub('{......}', '')
     text = repair_mojibake(ensure_utf8(text))
-    text = text:gsub('\r\n', '\n')
+    text = text:gsub('\r\n', '\n'):gsub('\r', '')
+    text = text:gsub('~[nN]~', '\n')
+    text = text:gsub('~[%a]~', '')
+    return text
+end
+
+function scanState.mark.objectHandle(sampId)
+    sampId = tonumber(sampId)
+    if not sampId or type(sampGetObjectHandleBySampId) ~= 'function' then return end
+    local ok, handle = pcall(sampGetObjectHandleBySampId, sampId)
+    if not ok or type(handle) ~= 'number' or handle <= 0 then return end
+    if type(doesObjectExist) == 'function' then
+        local okE, exists = pcall(doesObjectExist, handle)
+        if okE and not exists then return end
+    end
+    return handle
+end
+
+function scanState.mark.isSign(sampId)
+    local handle = scanState.mark.objectHandle(sampId)
+    if not handle or type(getObjectModel) ~= 'function' then return false end
+    local ok, model = pcall(getObjectModel, handle)
+    return ok and tonumber(model) == scanState.mark.abModel
+end
+
+function scanState.mark.parseShort(text)
+    text = scanState.mark.clean(text)
+    if text == '' then return nil end
+    local lines = {}
+    for line in text:gmatch('[^\n]+') do
+        line = line:gsub('^%s+', ''):gsub('%s+$', '')
+        if line ~= '' then lines[#lines + 1] = line end
+    end
+    if #lines < 2 then return nil end
+    local price, priceAt
+    for i = 1, #lines do
+        local p = parsePlatePrice(lines[i])
+        if p and p >= 1000000 and (not price or p > price) then
+            price, priceAt = p, i
+        end
+    end
+    if not price then return nil end
+    local vehicle
+    for i = 1, #lines do
+        if i ~= priceAt then
+            local name = normalizeName(lines[i])
+            local low = name:lower()
+            if name ~= '' and not name:find('***', 1, true)
+                and low ~= 'twin turbo' and low ~= 'twinturbo'
+                and not name:find('Продажа', 1, true)
+                and not name:find('Аукцион', 1, true)
+                and not name:find('Цена', 1, true)
+                and not name:find('Владел', 1, true)
+                and not name:find('Состояние', 1, true)
+            then
+                vehicle = name
+                break
+            end
+        end
+    end
+    if not vehicle then return nil end
+    return 'sale', vehicle, price, scanState.mark.turboOf(text)
+end
+
+function scanState.mark.looksLikePlate(text)
+    text = repair_mojibake(ensure_utf8(tostring(text or '')))
+    local s = text:lower()
+    if s:find('twin turbo', 1, true) or s:find('twinturbo', 1, true) then return true end
+    if text:find('Продажа транспорта', 1, true) or text:find('Цена:', 1, true) then return true end
+    if text:find('Аукцион №', 1, true) then return true end
+    local lines = 0
+    for _ in s:gmatch('[^\n]+') do lines = lines + 1 end
+    return lines >= 3 and s:find('%d[%d%.]*%d') ~= nil
+end
+
+function scanState.mark.holdShort(sampId, key, text, x, y, z)
+    local n = 0
+    for _ in pairs(scanState.mark.pendingShort) do n = n + 1 end
+    if n >= 30 and not scanState.mark.pendingShort[sampId] then return end
+    scanState.mark.pendingShort[sampId] = {
+        key = key,
+        text = text,
+        t = os.clock(),
+        x = x, y = y, z = z,
+    }
+end
+
+local function parseSalePlate(text)
+    text = scanState.mark.clean(text)
     if text == '' then return nil end
 
     local auc = text:match('Аукцион №%d+\n([^\n]+)')
     if auc then
         auc = normalizeName(auc)
         if auc ~= '' and not auc:find('***', 1, true) then
-            return 'auction', auc, nil
+            return 'auction', auc, nil, nil
         end
     end
 
@@ -1606,12 +1863,15 @@ local function parseSalePlate(text)
     if model == '' or not priceStr then return nil end
     local price = parsePlatePrice(priceStr)
     if not price or price <= 0 then return nil end
-    return 'sale', model, price
+    return 'sale', model, price, scanState.mark.turboOf(text)
 end
 
 local function stopSaleWatch()
     saleAlive = false
     incomingPlates = {}
+    scanState.mark.pendingShort = {}
+    scanState.mark.arm = nil
+    if scanState.mark.remove then scanState.mark.remove() end
 end
 
 local function vsAvgInfo(lot, avg)
@@ -1637,24 +1897,32 @@ local function vsAvgInfo(lot, avg)
     return info
 end
 
-local function notifyNewSale(kind, model, price)
+local function notifyNewSale(kind, model, price, turbo)
     if kind == 'auction' then
         chat(('Новый транспорт на аукционе: %s'):format(model))
         return
     end
-    local avg = lookupAvgPrice(model)
+    local tt = (turbo == 'Twin Turbo') and '{FF69B4}ТТ' or '{A0A0A0}Без ТТ'
+    local avg, avgName = resolveAvgForModel(model)
     if not avg then
-        chat(('На продажу выставлен: %s за %s | средняя неизвестна'):format(model, fmtMoney(price)))
+        chat(('На продаже: %s за %s | средняя неизвестна | %s'):format(
+            model, fmtMoney(price), tt))
         return
     end
+    local avgLabel = (avgName and avgName ~= model)
+        and (('средняя %s (%s)'):format(fmtMoney(avg), avgName))
+        or (('средняя %s'):format(fmtMoney(avg)))
     local gain = avg - (tonumber(price) or 0)
     if gain > 15000000 then
         local vs = vsAvgInfo(price, avg)
-        chat(('На продажу выставлен: %s за %s | средняя %s | {%s}%s %s'):format(
-            model, fmtMoney(price), fmtMoney(avg), vs.samp, vs.title, vs.detail))
+        local how = (vs.title == 'Дороже средней') and 'Дороже' or 'Дешевле'
+        local detail = (vs.detail or ''):gsub('%%', '')
+        chat(('На продаже: %s за %s | %s | {%s}%s %s | %s'):format(
+            model, fmtMoney(price), avgLabel, vs.samp, how, detail, tt))
         return
     end
-    chat(('На продажу выставлен: %s за %s | средняя %s'):format(model, fmtMoney(price), fmtMoney(avg)))
+    chat(('На продаже: %s за %s | %s | %s'):format(
+        model, fmtMoney(price), avgLabel, tt))
 end
 
 local function tryObjectPos(sampId)
@@ -1686,6 +1954,116 @@ end
 local function dist3(ax, ay, az, bx, by, bz)
     local dx, dy, dz = ax - bx, ay - by, az - bz
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+function scanState.mark.inAb()
+    return type(getActiveInterior) == 'function' and getActiveInterior() == scanState.mark.interior
+end
+
+function scanState.mark.play()
+    if type(addOneOffSound) ~= 'function' then return end
+    local x, y, z = playerPos()
+    if not x then return end
+    pcall(addOneOffSound, x, y, z, scanState.mark.sound)
+end
+
+function scanState.mark.remove()
+    if scanState.mark.object and type(doesObjectExist) == 'function' and doesObjectExist(scanState.mark.object) then
+        deleteObject(scanState.mark.object)
+    end
+    scanState.mark.object = nil
+    scanState.mark.expires = 0
+end
+
+function scanState.mark.show(x, y, z)
+    x, y, z = tonumber(x), tonumber(y), tonumber(z)
+    if not scanState.mark.modelReady or not x or not y or not z then return end
+    if not scanState.mark.inAb() then return end
+    if type(createObject) ~= 'function' then return end
+    scanState.mark.remove()
+    local obj = createObject(scanState.mark.arrowModel, x, y, z + scanState.mark.height)
+    if not obj or obj == 0 then
+        scanState.mark.object = nil
+        return
+    end
+    if type(doesObjectExist) == 'function' and not doesObjectExist(obj) then
+        scanState.mark.object = nil
+        return
+    end
+    pcall(setObjectCollision, obj, false)
+    pcall(setObjectScale, obj, scanState.mark.scale)
+    scanState.mark.object = obj
+    local now = (type(getGameTimer) == 'function') and getGameTimer() or 0
+    scanState.mark.expires = now + scanState.mark.duration
+end
+
+function scanState.mark.ensureModel()
+    if scanState.mark.modelReady or scanState.mark.modelFailed then return end
+    scanState.mark.modelTries = (scanState.mark.modelTries or 0) + 1
+    if type(requestModel) == 'function' then requestModel(scanState.mark.arrowModel) end
+    if type(hasModelLoaded) == 'function' and hasModelLoaded(scanState.mark.arrowModel) then
+        scanState.mark.modelReady = true
+        return
+    end
+    if scanState.mark.modelTries > 200 then
+        scanState.mark.modelFailed = true
+    end
+end
+
+function scanState.mark.flushArm()
+    local arm = scanState.mark.arm
+    if not arm then return end
+    if os.clock() > (arm.untilClock or 0) then
+        scanState.mark.arm = nil
+        return
+    end
+    if not scanState.mark.inAb() or not scanState.mark.isSign(arm.sampId) then return end
+    local x, y, z = tryObjectPos(arm.sampId)
+    scanState.mark.arm = nil
+    if not x then return end
+    if arm.sound then pcall(scanState.mark.play) end
+    scanState.mark.show(x, y, z)
+end
+
+function scanState.mark.flushShort()
+    local now = os.clock()
+    for id, item in pairs(scanState.mark.pendingShort) do
+        if now - (item.t or 0) > 8 then
+            scanState.mark.pendingShort[id] = nil
+        elseif scanState.mark.isSign(id) then
+            scanState.mark.pendingShort[id] = nil
+            pcall(onNewSalePlate, item.key, item.text, nil, item.x, item.y, item.z, id)
+        end
+    end
+end
+
+function scanState.mark.pump()
+    scanState.mark.ensureModel()
+    if not scanState.mark.inAb() then
+        if scanState.mark.object then scanState.mark.remove() end
+    elseif scanState.mark.object and type(doesObjectExist) == 'function' and doesObjectExist(scanState.mark.object) then
+        if type(getGameTimer) == 'function' and type(setObjectHeading) == 'function' then
+            local angle = (getGameTimer() / 1000 * scanState.mark.rotSpeed) % 360
+            setObjectHeading(scanState.mark.object, angle)
+        end
+        if scanState.mark.expires > 0 and getGameTimer() >= scanState.mark.expires then
+            scanState.mark.remove()
+        end
+    elseif scanState.mark.object then
+        scanState.mark.remove()
+    end
+    scanState.mark.flushArm()
+    scanState.mark.flushShort()
+end
+
+function scanState.mark.release()
+    scanState.mark.remove()
+    scanState.mark.arm = nil
+    scanState.mark.pendingShort = {}
+    if scanState.mark.modelReady and type(markModelAsNoLongerNeeded) == 'function' then
+        markModelAsNoLongerNeeded(scanState.mark.arrowModel)
+    end
+    scanState.mark.modelReady = false
 end
 
 local function rememberPlate(key, model, price, x, y, z)
@@ -1738,24 +2116,88 @@ local function lastFreshPlate(maxAge)
     return best
 end
 
+-- Табличка ↔ ПТС: Mercedes/Mercedes-Benz ок; W140 ≠ W221; «просто ближайшая» — нет.
+local function lotNameKey(s)
+    s = foldName(normalizeName(s))
+    s = s:gsub('mercedes%-benz', 'mercedes'):gsub('mercedes benz', 'mercedes')
+    s = s:gsub('%s+', ' ')
+    return s
+end
+
+local function isChassisToken(tok)
+    tok = tostring(tok or ''):gsub('[%(%[%]%)]', '')
+    return tok:match('^[WwEe]%d%d%d?$') ~= nil
+end
+
+-- score: 100 точное, 90 base+кузов, 0 нет. W140 и W221 друг с другом не матчятся.
+local function modelsMatchForLot(plateModel, ptsModel)
+    plateModel, ptsModel = normalizeName(plateModel), normalizeName(ptsModel)
+    if plateModel == '' or ptsModel == '' then return false, 0 end
+    local ka, kb = lotNameKey(plateModel), lotNameKey(ptsModel)
+    if ka == kb then return true, 100 end
+
+    local function onlyChassisExtra(short, long)
+        if #long <= #short then return false end
+        if long:sub(1, #short + 1) ~= short .. ' ' then return false end
+        local extra = long:sub(#short + 2)
+        if extra == '' then return false end
+        for tok in extra:gmatch('%S+') do
+            if not isChassisToken(tok) then return false end
+        end
+        return true
+    end
+
+    -- ПТС «Mercedes S600», табличка «Mercedes S600 W221» (или наоборот)
+    if onlyChassisExtra(ka, kb) or onlyChassisExtra(kb, ka) then
+        return true, 90
+    end
+    return false, 0
+end
+
 scanState.findLot = function(model)
     model = normalizeName(model)
     if model == '' then return nil end
     local now = os.clock()
-    local near = nearestPlate(22)
-    if near and normalizeName(near.model) == model then
-        local p = tonumber(near.price) or 0
-        if p >= 1000000 then return p end
-    end
-    local best, bestT
+    local px, py, pz = playerPos()
+    local maxDist = 12
+
+    local best -- { price, score, dist, t, plateModel }
     for _, row in pairs(knownPlates) do
         local p = tonumber(row.price) or 0
-        if normalizeName(row.model) == model and p >= 1000000
-            and (now - (row.t or 0)) < 180 and (not bestT or row.t > bestT) then
-            best, bestT = p, row.t
+        if p >= 1000000 and (now - (row.t or 0)) < 90 then
+            local ok, score = modelsMatchForLot(row.model, model)
+            if ok then
+                local d = nil
+                if px and row.x and row.y and row.z then
+                    d = dist3(px, py, pz, row.x, row.y, row.z)
+                end
+                -- без координат не берём: новая заехавшая машина иначе перебивает лот
+                if d and d <= maxDist then
+                    local better = false
+                    if not best then
+                        better = true
+                    elseif score > best.score then
+                        better = true
+                    elseif score == best.score and d < best.dist then
+                        better = true
+                    elseif score == best.score and d == best.dist and row.t > best.t then
+                        better = true
+                    end
+                    if better then
+                        best = {
+                            price = p,
+                            score = score,
+                            dist = d,
+                            t = row.t,
+                            plateModel = row.model,
+                        }
+                    end
+                end
+            end
         end
     end
-    return best
+    if best then return best.price, best.plateModel end
+    return nil
 end
 
 local function isGenericCarName(name)
@@ -1771,6 +2213,31 @@ function pendingSell.isActive()
     return type(pendingSell.lots) == 'table' and #pendingSell.lots > 0
 end
 
+-- С/C, О/O и остальные похожие буквы — одна машина. Кузов W140 и W221 по-прежнему разные.
+function pendingSell.sameModel(a, b)
+    if isGenericCarName(a) or isGenericCarName(b) then return false end
+    local ok = modelsMatchForLot(a, b)
+    return ok and true or false
+end
+
+function pendingSell.preferName(a, b)
+    a = normalizeName(a or '')
+    b = normalizeName(b or '')
+    if isGenericCarName(a) then return (not isGenericCarName(b)) and b or a end
+    if isGenericCarName(b) then return a end
+    if not pendingSell.sameModel(a, b) then return b ~= '' and b or a end
+    local fa, fb = foldName(a), foldName(b)
+    if #fb > #fa then return b end
+    return a
+end
+
+-- В мире только GAMESTATE_CONNECTED (3). Кик — 5, рестарт — 4, заход заново — 1..2.
+function pendingSell.inWorld()
+    if type(sampGetGamestate) ~= 'function' then return true end
+    local gs = sampGetGamestate()
+    return type(gs) == 'number' and gs == 3
+end
+
 function pendingSell.findLot(model, price)
     model = normalizeName(model or '')
     price = tonumber(price) or 0
@@ -1778,7 +2245,7 @@ function pendingSell.findLot(model, price)
     for i = 1, #(pendingSell.lots or {}) do
         local lot = pendingSell.lots[i]
         local sameModel = model ~= '' and not isGenericCarName(model)
-            and normalizeName(lot.model) == model
+            and pendingSell.sameModel(lot.model, model)
         local samePrice = price > 0 and lot.price == price
         if sameModel and samePrice then return i, lot end
         if sameModel and not byModel then byModel = i end
@@ -1804,10 +2271,10 @@ function pendingSell.addLot(model, price, source)
     for i = 1, #pendingSell.lots do
         local lot = pendingSell.lots[i]
         local sameCar = lot.price == price and (
-            isGenericCarName(lot.model) or model == '' or normalizeName(lot.model) == model
+            isGenericCarName(lot.model) or model == '' or pendingSell.sameModel(lot.model, model)
         )
         if sameCar then
-            if model ~= '' then lot.model = model end
+            if model ~= '' then lot.model = pendingSell.preferName(lot.model, model) end
             lot.t = os.clock()
             lot.at = os.time()
             lot.source = source or lot.source
@@ -1843,7 +2310,7 @@ function pendingSell.isOwn(model, price)
     for i = 1, #(pendingSell.lots or {}) do
         local lot = pendingSell.lots[i]
         if price and lot.price == price then
-            if isGenericCarName(lot.model) or lot.model == model or model == '' then
+            if isGenericCarName(lot.model) or model == '' or pendingSell.sameModel(lot.model, model) then
                 return true, i, lot
             end
         end
@@ -1906,8 +2373,13 @@ local function addDeal(action, model, price, source)
     price = tonumber(price) or 0
     local nowt = os.time()
     local last = dealLogs[#dealLogs]
-    if last and last.action == action and last.model == model
-        and last.price == price and (nowt - (last.time or 0)) <= 3 then
+    if last and last.action == action and last.price == price
+        and (nowt - (last.time or 0)) <= 3
+        and (last.model == model or pendingSell.sameModel(last.model, model)) then
+        if isGenericCarName(last.model) and not isGenericCarName(model) then
+            last.model = model
+            saveDealLogs()
+        end
         return false
     end
     dealLogs[#dealLogs + 1] = {
@@ -2064,9 +2536,18 @@ local function processDealChat(raw)
     end
     if sold_model and sold_price then
         local price = parseAbbrevPrice(sold_price)
-        if price then addDeal('sell', sold_model, price, 'chat') end
         pendingSell.awaitSell = 0
-        local idx = pendingSell.findLot(sold_model, price)
+        local idx, lot = pendingSell.findLot(sold_model, price)
+        local model = sold_model
+        if lot then
+            model = pendingSell.preferName(lot.model, sold_model)
+        else
+            local _, avgName = resolveAvgForModel(sold_model)
+            if avgName and avgName ~= '' then
+                model = pendingSell.preferName(avgName, sold_model)
+            end
+        end
+        if price then addDeal('sell', model, price, 'chat') end
         if idx then pendingSell.removeLot(idx) end
     end
 end
@@ -2081,7 +2562,16 @@ end
 -- RPC только копирует строку/числа. Чат — в pump, не из пакета.
 onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     if not saleAlive then return end
-    local kind, model, price = parseSalePlate(text)
+    local fromSign = sampId and scanState.mark.isSign(sampId) or false
+    local kind, model, price, turbo = parseSalePlate(text)
+    if not kind then
+        local tt = scanState.mark.turboOf(text) == 'Twin Turbo'
+        if fromSign or tt or scanState.mark.inAb() then
+            kind, model, price, turbo = scanState.mark.parseShort(text)
+        elseif sampId and not scanState.mark.objectHandle(sampId) and scanState.mark.looksLikePlate(text) then
+            scanState.mark.holdShort(sampId, key, text, x, y, z)
+        end
+    end
     if not kind then return end
     if kind == 'sale' and minPrice and price < minPrice then return end
 
@@ -2105,11 +2595,28 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
         end
     end
 
-    local token = (kind == 'auction') and ('AUC/' .. model) or ('%s/%s'):format(model, tostring(price))
+    local token = (kind == 'auction') and ('AUC/' .. model)
+        or ('%s/%s/%s'):format(model, tostring(price), turbo or '')
     if PLATES[key] == token then return end
+    -- Пока пауза после своего лота: не запоминаем табличку, иначе она уже
+    -- никогда не попадёт в чат.
+    if os.clock() <= (pendingSell.muteNtfy or 0) then return end
     PLATES[key] = token
-    if notifyNewSales[0] and not own and os.clock() > (pendingSell.muteNtfy or 0) then
-        pcall(notifyNewSale, kind, model, price)
+    if notifyNewSales[0] and not own then
+        local okN, errN = pcall(notifyNewSale, kind, model, price, turbo)
+        if not okN then
+            print('AutoABarz notify: ' .. tostring(errN))
+        end
+        if scanState.mark.inAb() and (fromSign or turbo == 'Twin Turbo') then
+            pcall(scanState.mark.play)
+            if x and y and z then
+                pcall(scanState.mark.show, x, y, z)
+            elseif sampId then
+                scanState.mark.arm = { sampId = sampId, sound = false, untilClock = os.clock() + 8 }
+            end
+        elseif sampId and scanState.mark.inAb() and not scanState.mark.objectHandle(sampId) then
+            scanState.mark.arm = { sampId = sampId, sound = true, untilClock = os.clock() + 8 }
+        end
     end
 end
 
@@ -2147,19 +2654,11 @@ local function pumpSales()
     if not saleAlive then return end
 
     if pendingSell.dropListed then
-        local had = pendingSell.isActive()
-        pendingSell.dropListed = false
-        forgetListed()
-        if had then
-            chat('Лоты на АБ сброшены: кик/дисконнект — выставьте машины заново')
-        end
+        dropListedNow('Лоты на АБ сброшены: кик/дисконнект — выставьте машины заново')
     end
     pcall(function()
-        if type(sampGetGamestate) == 'function' and pendingSell.isActive() then
-            local gs = sampGetGamestate()
-            if type(gs) == 'number' and gs < 3 then
-                pendingSell.dropListed = true
-            end
+        if pendingSell.isActive() and not pendingSell.inWorld() then
+            dropListedNow('Лоты на АБ сброшены: кик/дисконнект — выставьте машины заново')
         end
     end)
 
@@ -2302,29 +2801,6 @@ local function looksLikeVehicleDoc(doc, event, text)
     return false
 end
 
-local function resolveAvgForModel(model)
-    model = normalizeName(model)
-    if model == '' then return nil, model end
-    local p = lookupAvgPrice(model)
-    if p then return p, model end
-    local rows = findPrices(model)
-    if #rows == 1 then return rows[1].price, rows[1].name end
-    for i = 1, #rows do
-        local n = rows[i].name
-        if n:find(model, 1, true) or model:find(n, 1, true) then
-            return rows[i].price, n
-        end
-    end
-    local short = model:match('^(%S+%s+%S+)') or model:match('^(%S+)')
-    if short and short ~= model then
-        p = lookupAvgPrice(short)
-        if p then return p, short end
-        rows = findPrices(short)
-        if #rows == 1 then return rows[1].price, rows[1].name end
-    end
-    return nil, model
-end
-
 local function parsePassportModel(text)
     text = stripColors(ensure_utf8(tostring(text or '')))
     local m = text:match('Транспорт:%s*([^\r\n]+)')
@@ -2342,26 +2818,51 @@ local function isPassportDialog(id, title)
     return title:find('Технический паспорт транспорта', 1, true) and true or false
 end
 
+local function passportLotFromText(utf)
+    utf = ensure_utf8(tostring(utf or ''))
+    -- только явная цена продажи, не путать с пробегом/др.
+    for line in utf:gmatch('[^\r\n]+') do
+        local plain = stripColors(line)
+        local low = plain:lower()
+        if low:find('пробег', 1, true) or low:find('mileage', 1, true) then
+            -- skip
+        else
+            local ps = plain:match('Цена продажи:%s*(.+)$')
+                or plain:match('Цена:%s*(.+)$')
+                or plain:match('Стоимость:%s*(.+)$')
+            if ps then
+                local p = parsePlatePrice(ps)
+                if p and p >= 1000000 then return p end
+            end
+        end
+    end
+    return nil
+end
+
 local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     if not showPassportAvg[0] then return end
     text = tostring(text or '')
     local utf = ensure_utf8(text)
     if utf:find('Средняя цена:', 1, true) or utf:find('Дешевле средней', 1, true) then return end
     local model = parsePassportModel(text)
-    local avg = model and resolveAvgForModel(model) or nil
-    local lot = model and scanState.findLot(model) or nil
-    if (not lot or lot < 1000000) and model then
-        local ps = utf:match('Цена:%s*([^\r\n]+)')
-        if ps and not ensure_utf8(ps):find('робег', 1, true) then
-            local p = parsePlatePrice(ps)
-            if p and p >= 1000000 then lot = p end
-        end
+    local avg, avgName = nil, nil
+    if model then avg, avgName = resolveAvgForModel(model) end
+    -- приоритет: табличка рядом → текст ПТС (цена продажи)
+    local lot = model and select(1, scanState.findLot(model)) or nil
+    if (not lot or lot < 1000000) then
+        lot = passportLotFromText(utf)
     end
-    local parts = { ('Средняя цена: %s'):format(avg and fmtMoney(avg) or 'нет в базе') }
+    local avgLabel = avg and fmtMoney(avg) or 'нет в базе'
+    if avg and avgName and model and foldName(avgName) ~= foldName(model) then
+        avgLabel = ('%s (%s)'):format(avgLabel, avgName)
+    end
+    local parts = { ('Средняя цена: %s'):format(avgLabel) }
     if lot and lot >= 1000000 then
         parts[#parts + 1] = ('Лот: %s'):format(fmtMoney(lot))
         local vs = vsAvgInfo(lot, avg)
         if vs.title == 'Дешевле средней' then
+            parts[#parts + 1] = ('{%s}%s %s'):format(vs.samp, vs.title, vs.detail)
+        elseif vs.title == 'Дороже средней' then
             parts[#parts + 1] = ('{%s}%s %s'):format(vs.samp, vs.title, vs.detail)
         end
     end
@@ -2382,22 +2883,38 @@ local function queuePassportOverlay(model, sid, lot)
     if not showPassportAvg[0] or model == '' then return end
     passportJob.model = model
     passportJob.sid = tonumber(sid) or 0
-    passportJob.lotPrice = tonumber(lot) or 0
+    lot = tonumber(lot) or 0
+    if lot < 1000000 then
+        lot = select(1, scanState.findLot(model)) or 0
+    end
+    passportJob.lotPrice = (lot >= 1000000) and lot or 0
+    passportJob.lotModel = model
     passportJob.at = os.clock() + 0.28
     passportJob.tries = 0
 end
 
 local function injectPassportPrice(model)
     if not (ok_arz and arz and arz.eval) then return end
-    local avg = resolveAvgForModel(model)
-    local lot = scanState.findLot(model) or tonumber(passportJob.lotPrice) or 0
+    local avg, avgName = resolveAvgForModel(model)
+    -- только табличка этой модели рядом; stale lotPrice — лишь если модель та же
+    local lot = select(1, scanState.findLot(model)) or 0
+    if lot < 1000000
+        and passportJob.lotModel
+        and foldName(passportJob.lotModel) == foldName(model)
+    then
+        lot = tonumber(passportJob.lotPrice) or 0
+    end
     if lot < 1000000 then lot = 0 end
-    local lines = { avg and ('Средняя: %s'):format(fmtMoney(avg)) or 'Средняя: нет в базе' }
+    local avgLine = avg and ('Средняя: %s'):format(fmtMoney(avg)) or 'Средняя: нет в базе'
+    if avg and avgName and model and foldName(avgName) ~= foldName(model) then
+        avgLine = ('Средняя: %s (%s)'):format(fmtMoney(avg), avgName)
+    end
+    local lines = { avgLine }
     local color = '#f3f3f3'
     if lot >= 1000000 then
         lines[#lines + 1] = ('Лот: %s'):format(fmtMoney(lot))
         local vs = vsAvgInfo(lot, avg)
-        if vs.title == 'Дешевле средней' then
+        if vs.title == 'Дешевле средней' or vs.title == 'Дороже средней' then
             color = vs.color
             lines[#lines + 1] = (vs.title .. ' ' .. vs.detail):gsub('%s+$', '')
         end
@@ -2481,14 +2998,26 @@ local function noteVehiclePassport(packet)
     if not model then
         model = parsePassportModel(text)
     end
-    local lot = model and scanState.findLot(model) or nil
+    -- 1) табличка рядом  2) CEF sellPrice  3) текст
+    local lot = model and select(1, scanState.findLot(model)) or nil
     if (not lot or lot < 1000000) and type(doc) == 'table' then
         local raw = doc.sellPrice or doc.sell_price or doc.listingPrice or doc.lotPrice
+            or doc.price or doc.cost
         if type(raw) == 'table' then raw = raw.value or raw.price or raw[1] end
         local p
         if type(raw) == 'string' then p = parsePlatePrice(raw)
-        elseif type(raw) == 'number' then p = math.floor(raw) end
+        elseif type(raw) == 'number' then
+            p = math.floor(raw)
+            -- иногда приходит в тысячах / сокращённо
+            if p > 0 and p < 1000000 then
+                local scaled = p * 1000
+                if scaled >= 1000000 and scaled < 2147483647 then p = scaled end
+            end
+        end
         if p and p >= 1000000 then lot = p end
+    end
+    if (not lot or lot < 1000000) then
+        lot = passportLotFromText(text)
     end
     if model then queuePassportOverlay(model, sid, (lot and lot >= 1000000) and lot or 0) end
 end
@@ -2668,12 +3197,13 @@ if ok_ev and ev then
 
     local prevLost = ev.onConnectionLost
     function ev.onConnectionLost()
-        pendingSell.dropListed = true
+        -- сразу в deals.json, до возможной выгрузки скрипта при реконнекте
+        pcall(forgetListed)
         if prevLost then pcall(prevLost) end
     end
     local prevClosed = ev.onConnectionClosed
     function ev.onConnectionClosed()
-        pendingSell.dropListed = true
+        pcall(forgetListed)
         if prevClosed then pcall(prevClosed) end
     end
 else
@@ -2931,6 +3461,518 @@ scanState.pumpHttpJobs = function()
         end
     end
     scanState.httpJobs = rest
+end
+
+---------------------------------------------------------------------------
+-- Картинки машин (База) — всё через carImg.*, без новых local
+---------------------------------------------------------------------------
+function carImg.safeKey(name)
+    name = normalizeName(name):lower()
+    name = name:gsub('[^%w%+%-%._]+', '_')
+    name = name:gsub('_+', '_'):gsub('^_', ''):gsub('_$', '')
+    if name == '' then name = 'car' end
+    if #name > 80 then name = name:sub(1, 80) end
+    return name
+end
+
+function carImg.localPath(name)
+    local key = carImg.safeKey(name)
+    local exts = { '.jpg', '.jpeg', '.png', '.bmp' }
+    for i = 1, #exts do
+        local p = carImg.dir .. '\\' .. key .. exts[i]
+        if doesFileExist(p) then return p end
+    end
+    return carImg.dir .. '\\' .. key .. '.jpg'
+end
+
+function carImg.releaseSlot(slot)
+    if type(slot) == 'table' then slot.tex = nil end
+end
+
+function carImg.ensureSlot(name)
+    name = normalizeName(name)
+    local slot = carImg.slots[name]
+    if not slot then
+        slot = { status = 'idle', path = '', tex = nil, msg = '', model_id = nil }
+        carImg.slots[name] = slot
+    end
+    return slot
+end
+
+function carImg.normKey(s)
+    s = normalizeName(s):lower()
+    s = s:gsub('mercedes%-benz', 'mercedes'):gsub('mercedes benz', 'mercedes')
+    s = s:gsub('lamborghini%s+', ''):gsub('porsche%s+', 'porche ')
+    s = s:gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+    return s
+end
+
+function carImg.ingestVehiclesJson(raw)
+    raw = tostring(raw or '')
+    if raw == '' then return 0 end
+    local n = 0
+    for block in raw:gmatch('%b{}') do
+        local name = block:match('"name"%s*:%s*"([^"]+)"')
+        local mid = tonumber(block:match('"model_id"%s*:%s*(%d+)'))
+        local sid = tonumber(block:match('"server_id"%s*:%s*(%d+)'))
+        -- картинки на CDN чаще по server_id; model_id — запасной
+        local imgId = sid or mid
+        if name and imgId and imgId > 0 then
+            name = normalizeName(name)
+            carImg.byName[name:lower()] = {
+                name = name,
+                model_id = mid or imgId,
+                server_id = sid or imgId,
+                img_id = imgId,
+                key = carImg.normKey(name),
+            }
+            n = n + 1
+        end
+    end
+    return n
+end
+
+function carImg.loadVehiclesMap(force)
+    if carImg.mapLoading then return end
+    if carImg.mapReady and not force then return end
+    carImg.mapLoading = true
+    if doesFileExist(carImg.mapFile) and not force then
+        local f = io.open(carImg.mapFile, 'r')
+        if f then
+            local raw = f:read('*a')
+            f:close()
+            if carImg.ingestVehiclesJson(raw) > 0 then
+                carImg.mapReady = true
+                carImg.mapLoading = false
+                return
+            end
+        end
+    end
+    httpRequestAsync('GET',
+        'https://api.arztools.tech/tools/arizona/vehicles.json',
+        '',
+        { ['User-Agent'] = 'AutoABarz', ['Accept'] = 'application/json' },
+        function(body, err)
+            carImg.mapLoading = false
+            body = tostring(body or '')
+            if err or #body < 200 then return end
+            if carImg.ingestVehiclesJson(body) <= 0 then return end
+            carImg.mapReady = true
+            pcall(function()
+                local f = io.open(carImg.mapFile, 'w')
+                if f then f:write(body) f:close() end
+            end)
+        end,
+        25)
+end
+
+-- Возвращает img_id (для CDN), отобрамое имя, model_id
+function carImg.resolveModelId(model)
+    model = normalizeName(model)
+    if model == '' then return nil, nil, nil end
+    local hit = carImg.byName[model:lower()]
+    if hit then return hit.img_id, hit.name, hit.model_id end
+
+    local q = carImg.normKey(model)
+    for _, cand in ipairs(avgNameCandidates(model)) do
+        hit = carImg.byName[cand:lower()]
+        if hit then return hit.img_id, hit.name, hit.model_id end
+        local cq = carImg.normKey(cand)
+        for _, row in pairs(carImg.byName) do
+            if row.key == cq then
+                return row.img_id, row.name, row.model_id
+            end
+        end
+    end
+
+    -- префикс / вхождение после нормализации (Mercedes S600 → … S600 W140)
+    local best, bestScore
+    for _, row in pairs(carImg.byName) do
+        local k = row.key or ''
+        if k == q then
+            return row.img_id, row.name, row.model_id
+        end
+        local score
+        if k:sub(1, #q + 1) == q .. ' ' then
+            score = 500 - (#k - #q) -- короче хвост — лучше для «S600» без кузова
+        elseif q:sub(1, #k + 1) == k .. ' ' then
+            score = 400
+        elseif k:find(q, 1, true) then
+            score = 300 - (#k - #q)
+        elseif q:find(k, 1, true) and #k >= 5 then
+            score = 200
+        end
+        if score and (not bestScore or score > bestScore) then
+            best, bestScore = row, score
+        end
+    end
+    if best then return best.img_id, best.name, best.model_id end
+    return nil, nil, nil
+end
+
+function carImg.cdnUrl(imgId, mirror)
+    imgId = tonumber(imgId)
+    if not imgId then return nil end
+    mirror = tonumber(mirror) or 1
+    local base = carImg.cdn[mirror] or carImg.cdn[1]
+    return base .. tostring(imgId) .. '.png'
+end
+
+function carImg.cachePathById(imgId)
+    return carImg.dir .. '\\' .. tostring(imgId) .. '.png'
+end
+
+function carImg.tryCdn(name, imgId, mirror, triedMid)
+    imgId = tonumber(imgId)
+    mirror = tonumber(mirror) or 1
+    local slot = carImg.ensureSlot(name)
+    if not imgId then
+        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
+        return
+    end
+    local dest = carImg.cachePathById(imgId)
+    if doesFileExist(dest) then
+        carImg.releaseSlot(slot)
+        slot.path = dest
+        slot.status = 'ready'
+        slot.msg = ''
+        slot.img_id = imgId
+        return
+    end
+    local url = carImg.cdnUrl(imgId, mirror)
+    if not url then
+        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
+        return
+    end
+    slot.status = 'loading'
+    slot.msg = 'CDN Arizona…'
+    slot.img_id = imgId
+    carImg.dlFail = function()
+        if mirror < #carImg.cdn then
+            carImg.tryCdn(name, imgId, mirror + 1, triedMid)
+            return
+        end
+        local mid = tonumber(slot.model_id)
+        if mid and mid ~= imgId and not triedMid then
+            carImg.tryCdn(name, mid, 1, true)
+            return
+        end
+        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
+    end
+    carImg.startFileDownload(name, url, dest)
+end
+
+function carImg.wikiTitles(model)
+    local out, seen = {}, {}
+    local function push(s)
+        s = normalizeName(s)
+        if s == '' then return end
+        s = s:gsub('%s+', '_')
+        if seen[s] then return end
+        seen[s] = true
+        out[#out + 1] = s
+    end
+    for _, cand in ipairs(avgNameCandidates(model)) do
+        push(cand)
+        push(cand:gsub('^Mercedes%s+', 'Mercedes-Benz '))
+        local base, ch = cand:match('^(.+)%s+([WwEe]%d%d%d?)$')
+        if base and ch then
+            ch = ch:upper()
+            push(base .. ' (' .. ch .. ')')
+            push((base:gsub('^Mercedes%s+', 'Mercedes-Benz ')) .. ' (' .. ch .. ')')
+            if base:lower():find('s%d%d%d', 1) or base:lower():find('s%-?class', 1) then
+                push('Mercedes-Benz S-Class (' .. ch .. ')')
+            end
+            if base:lower():find('x5', 1, true) then
+                push('BMW X5 (' .. ch .. ')')
+            end
+            if base:lower():find('m5', 1, true) then
+                push('BMW M5 (' .. ch .. ')')
+            end
+        end
+    end
+    return out
+end
+
+function carImg.parseWikiThumb(json)
+    json = tostring(json or '')
+    local url = json:match('"thumbnail"%s*:%s*%b{}')
+    if url then url = url:match('"source"%s*:%s*"(.-)"') end
+    if not url then
+        url = json:match('"originalimage"%s*:%s*%b{}')
+        if url then url = url:match('"source"%s*:%s*"(.-)"') end
+    end
+    if not url or url == '' then return nil end
+    url = url:gsub('\\/', '/'):gsub('\\u0026', '&'):gsub('%?.*$', '')
+    if not url:find('^https?://') then return nil end
+    if not (url:lower():find('%.jpe?g') or url:lower():find('%.png') or url:lower():find('%.bmp')) then
+        if not url:find('upload%.wikimedia%.org', 1) then return nil end
+    end
+    return url
+end
+
+function carImg.onDownloadFail(name)
+    local fail = carImg.dlFail
+    carImg.dlFail = nil
+    carImg.dl = nil
+    if type(fail) == 'function' then
+        pcall(fail)
+        return
+    end
+    local slot = carImg.ensureSlot(name)
+    slot.status = 'fail'
+    slot.msg = 'не скачалась'
+end
+
+function carImg.startFileDownload(name, url, dest)
+    if type(downloadUrlToFile) ~= 'function' then
+        httpRequestAsync('GET', url, '', {
+            ['User-Agent'] = 'AutoABarz/car-preview',
+            ['Accept'] = 'image/png,image/*,*/*',
+        }, function(body, err)
+            local slot = carImg.ensureSlot(name)
+            if carImg.activeName ~= name and carImg.dlFail then
+                -- устаревшая закачка
+                carImg.dl = nil
+                return
+            end
+            if err or type(body) ~= 'string' or #body < 800 then
+                carImg.onDownloadFail(name)
+                return
+            end
+            local b1, b2, b3, b4 = body:byte(1, 4)
+            local isPng = b1 == 137 and b2 == 80 and b3 == 78 and b4 == 71 -- PNG
+            local isJpg = b1 == 0xFF and b2 == 0xD8
+            if not isPng and not isJpg then
+                pcall(os.remove, dest)
+                carImg.onDownloadFail(name)
+                return
+            end
+            pcall(function()
+                local f = io.open(dest, 'wb')
+                if f then f:write(body) f:close() end
+            end)
+            carImg.dlFail = nil
+            if doesFileExist(dest) then
+                slot.path = dest
+                slot.status = 'ready'
+                slot.msg = ''
+            else
+                carImg.onDownloadFail(name)
+                return
+            end
+            carImg.dl = nil
+        end, 30)
+        carImg.dl = { name = name, path = dest, via = 'http' }
+        return
+    end
+    local ml = require('moonloader')
+    local ds = ml and ml.download_status
+    carImg.dl = {
+        name = name,
+        path = dest,
+        via = 'ml',
+        done = false,
+        ok = false,
+        t0 = os.clock(),
+    }
+    local job = carImg.dl
+    pcall(downloadUrlToFile, url, dest, function(_, status)
+        if not ds then return end
+        if status == ds.STATUS_ENDDOWNLOADDATA or status == ds.STATUSEX_ENDDOWNLOAD then
+            job.done = true
+            job.ok = true
+        end
+    end)
+end
+
+function carImg.tryWiki(name, titles, idx)
+    idx = tonumber(idx) or 1
+    carImg.dlFail = nil
+    local slot = carImg.ensureSlot(name)
+    if idx > #titles then
+        slot.status = 'fail'
+        slot.msg = 'нет на CDN'
+        return
+    end
+    slot.status = 'loading'
+    slot.msg = 'поиск…'
+    local title = titles[idx]
+    local url = 'https://en.wikipedia.org/api/rest_v1/page/summary/' .. title
+    httpRequestAsync('GET', url, '', {
+        ['User-Agent'] = 'AutoABarz/car-preview (moonloader)',
+        ['Accept'] = 'application/json',
+    }, function(body, err)
+        if carImg.activeName ~= name then return end
+        local thumb = (not err) and carImg.parseWikiThumb(body) or nil
+        if not thumb then
+            carImg.tryWiki(name, titles, idx + 1)
+            return
+        end
+        slot.msg = 'скачиваю…'
+        local dest = carImg.localPath(name)
+        if not dest:lower():match('%.jpe?g$') then
+            dest = carImg.dir .. '\\' .. carImg.safeKey(name) .. '.jpg'
+        end
+        carImg.startFileDownload(name, thumb, dest)
+    end, 15)
+end
+
+function carImg.request(name)
+    name = normalizeName(name)
+    if name == '' then return end
+    carImg.activeName = name
+    carImg.loadVehiclesMap(false)
+    local slot = carImg.ensureSlot(name)
+
+    if slot.tex and slot.status == 'ok' then return end
+    if slot.status == 'loading' or slot.status == 'ready' then return end
+
+    local imgId, matched, mid = carImg.resolveModelId(name)
+    slot.img_id = imgId
+    slot.model_id = mid
+    slot.matched = matched
+
+    -- кэш по id с CDN
+    if imgId then
+        local byId = carImg.cachePathById(imgId)
+        if doesFileExist(byId) then
+            carImg.releaseSlot(slot)
+            slot.path = byId
+            slot.status = 'ready'
+            slot.msg = ''
+            return
+        end
+    end
+
+    -- ручной файл по имени
+    local key = carImg.safeKey(name)
+    for _, ext in ipairs({ '.jpg', '.jpeg', '.png', '.bmp' }) do
+        local p = carImg.dir .. '\\' .. key .. ext
+        if doesFileExist(p) then
+            carImg.releaseSlot(slot)
+            slot.path = p
+            slot.status = 'ready'
+            slot.msg = ''
+            return
+        end
+    end
+
+    if not imgId then
+        if carImg.mapLoading or not carImg.mapReady then
+            slot.status = 'loading'
+            slot.msg = 'карта машин…'
+            carImg.pending = name
+            return
+        end
+        slot.status = 'loading'
+        slot.msg = 'загрузка…'
+        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
+        return
+    end
+
+    slot.status = 'loading'
+    slot.msg = 'CDN Arizona…'
+    carImg.tryCdn(name, imgId, 1, false)
+end
+
+function carImg.pump()
+    if carImg.pending and carImg.mapReady then
+        local n = carImg.pending
+        carImg.pending = nil
+        local slot = carImg.slots[n]
+        if slot and not slot.tex then
+            slot.status = 'idle'
+            if carImg.activeName == n then
+                carImg.request(n)
+            end
+        end
+    end
+
+    local dl = carImg.dl
+    if dl and dl.via == 'ml' then
+        if dl.done or (os.clock() - (dl.t0 or 0)) > 45 then
+            local slot = carImg.ensureSlot(dl.name)
+            if dl.ok and doesFileExist(dl.path) then
+                local f = io.open(dl.path, 'rb')
+                local head = f and f:read(8) or ''
+                if f then f:close() end
+                local isPng = head:sub(1, 4) == '\137PNG'
+                local isJpg = head:byte(1) == 0xFF and head:byte(2) == 0xD8
+                if not isPng and not isJpg then
+                    pcall(os.remove, dl.path)
+                    carImg.onDownloadFail(dl.name)
+                else
+                    carImg.dlFail = nil
+                    slot.path = dl.path
+                    slot.status = 'ready'
+                    slot.msg = ''
+                    carImg.dl = nil
+                end
+            else
+                pcall(os.remove, dl.path)
+                carImg.onDownloadFail(dl.name)
+            end
+        end
+    end
+
+    if carImg.activeName then
+        local slot = carImg.slots[carImg.activeName]
+        if slot and slot.status == 'ready' and slot.path ~= '' and not slot.tex then
+            if doesFileExist(slot.path) then
+                local ok, tex = pcall(imgui.CreateTextureFromFile, slot.path)
+                if ok and tex then
+                    slot.tex = tex
+                    slot.status = 'ok'
+                    slot.msg = ''
+                else
+                    slot.status = 'fail'
+                    slot.msg = 'не открылась'
+                end
+            else
+                slot.status = 'fail'
+                slot.msg = 'файл пропал'
+            end
+        end
+    end
+end
+
+function carImg.drawPreview(name, maxW)
+    name = normalizeName(name)
+    if name == '' then return end
+    if carImg.activeName ~= name then
+        carImg.request(name)
+    elseif carImg.slots[name] and carImg.slots[name].status == 'idle' then
+        carImg.request(name)
+    end
+    local slot = carImg.ensureSlot(name)
+    if slot.img_id == nil and carImg.mapReady then
+        local imgId, matched, mid = carImg.resolveModelId(name)
+        slot.img_id, slot.matched, slot.model_id = imgId, matched, mid
+    end
+    maxW = tonumber(maxW) or 280
+    local h = math.floor(maxW * 0.62)
+    if slot.tex and slot.status == 'ok' then
+        imgui.Image(slot.tex, imgui.ImVec2(maxW, h))
+    else
+        imgui.BeginChild('##carprev', imgui.ImVec2(maxW, h), true)
+        local msg = slot.msg
+        if slot.status == 'loading' then
+            msg = msg ~= '' and msg or 'загрузка…'
+        elseif slot.status == 'fail' then
+            msg = msg ~= '' and msg or 'нет картинки'
+        else
+            msg = 'превью…'
+        end
+        imgui.SetCursorPos(imgui.ImVec2(12, h / 2 - 8))
+        imgui.TextDisabled(msg)
+        imgui.EndChild()
+    end
+    if slot.img_id then
+        imgui.TextDisabled(('CDN id  %d'):format(slot.img_id))
+    elseif slot.model_id then
+        imgui.TextDisabled(('model  %d'):format(slot.model_id))
+    end
 end
 
 -- Автообновление через effil (как ntfy/share). downloadUrlToFile + wait() в колбэке крашит lua51.dll.
@@ -3620,7 +4662,7 @@ local function setCString(buf, cap, s)
 end
 local filter = ''
 local page = 1
-local WIN_W, WIN_H, SIDEBAR = 760, 560, 168
+local WIN_W, WIN_H, SIDEBAR = 1020, 680, 176
 local CHAT_W, CHAT_H = 380, 470
 local accentCol = { 0.36, 0.58, 1.0 }
 local PAGES = {
@@ -3804,7 +4846,8 @@ local function drawBase()
     spaced(0, 4)
     local rows = findPrices(filter)
     local listH = WIN_H - 168
-    imgui.BeginChild('##left', imgui.ImVec2(300, listH), true)
+    local leftW = 440
+    imgui.BeginChild('##left', imgui.ImVec2(leftW, listH), true)
         imgui.TextDisabled(('Машины  ·  %d'):format(#rows))
         spaced(0, 2)
         if #rows == 0 then
@@ -3815,9 +4858,9 @@ local function drawBase()
                 if imgui.Selectable(row.name, selectedName == row.name) then
                     selectedName = row.name
                 end
-                imgui.SameLine(168)
+                imgui.SameLine(250)
                 imgui.TextDisabled(('%d/30'):format(math.min(row.days, 30)))
-                imgui.SameLine(214)
+                imgui.SameLine(300)
                 imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), fmtMoney(row.price))
                 imgui.PopID()
             end
@@ -3830,9 +4873,15 @@ local function drawBase()
         else
             local info = prices[selectedName]
             imgui.PushStyleColor(imgui.Col.Text, accent())
-            imgui.Text(selectedName)
+            imgui.TextWrapped(selectedName)
             imgui.PopStyleColor()
             imgui.Text(('Средняя: %s'):format(fmtMoney(info.price or 0)))
+            spaced(0, 6)
+            local prevW = math.floor(imgui.GetContentRegionAvail().x)
+            if prevW < 280 then prevW = 280 end
+            if prevW > 420 then prevW = 420 end
+            carImg.drawPreview(selectedName, prevW)
+            spaced(0, 4)
             imgui.Separator()
             imgui.TextDisabled('Продажи по дням')
             spaced(0, 4)
@@ -3843,7 +4892,7 @@ local function drawBase()
                 for j = 1, math.min(#days, MAX_DAYS) do
                     local row = days[j]
                     imgui.Text(tostring(row.date))
-                    imgui.SameLine(130)
+                    imgui.SameLine(150)
                     imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), fmtMoney(row.price))
                 end
             end
@@ -3877,8 +4926,6 @@ local function drawScan()
     imgui.Text(('Пауза между кликами: %d мс'):format(tonumber(waitPageMs[0]) or 0))
     imgui.SetNextItemWidth(280)
     imgui.SliderInt('##wp', waitPageMs, 0, 40)
-    imgui.TextDisabled('0 — быстрее. Уже снятые сегодня дни пропускаются.')
-    imgui.TextDisabled('В средних ценах — Сканировать. Стоп только здесь. База пишется сама.')
 
     spaced(0, 14)
     sectionTitle('Бинды')
@@ -3906,7 +4953,6 @@ local function drawScan()
     if imgui.SmallButton(scanState.bindWait == 'mouse' and '...' or 'Сменить##bms') then
         scanState.bindWait = 'mouse'
     end
-    imgui.TextDisabled('Мышь в чате — удерживать.')
 
     spaced(0, 14)
     sectionTitle('Автообновление GitHub')
@@ -3914,7 +4960,6 @@ local function drawScan()
     if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
         scanState.checkUpdate(true)
     end
-    imgui.TextDisabled('/abupdate — проверить вручную')
 end
 
 local function drawDeals()
@@ -4050,6 +5095,209 @@ local PAGE_DRAW = {
     deals = drawDeals,
 }
 
+scanState.forumUrl = 'https://www.blast.hk/threads/257682/#post-1695478'
+scanState.logoUrl = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/images/abarz-logo.png'
+scanState.eventsLibBase = {
+    'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/arizona-events/',
+    'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/arizona-events/',
+}
+scanState.eventsLibFiles = {
+    { 'init.lua', '' },
+    { 'subprocess.lua', '' },
+    { 'core.lua', 'bad packet size' },
+    { 'bitstream.lua', 'oversized string' },
+}
+
+function scanState.eventsLibPath(name)
+    return getWorkingDirectory() .. '\\lib\\arizona-events\\' .. name
+end
+
+function scanState.eventsLibOk(name, marker)
+    local f = io.open(scanState.eventsLibPath(name), 'rb')
+    if not f then return false end
+    local s = f:read('*a') or ''
+    f:close()
+    if #s < 32 then return false end
+    local head = s:sub(1, 64):lower()
+    if head:find('<!doctype', 1, true) or head:find('<html', 1, true) then return false end
+    if marker and marker ~= '' and not s:find(marker, 1, true) then return false end
+    return true
+end
+
+function scanState.downloadLibFile(name)
+    ensureDir(getWorkingDirectory() .. '\\lib')
+    ensureDir(getWorkingDirectory() .. '\\lib\\arizona-events')
+    local path = scanState.eventsLibPath(name)
+    if type(downloadUrlToFile) ~= 'function' then return false end
+    local ml = require('moonloader')
+    local ds = ml and ml.download_status
+    if not ds then return false end
+    local bases = scanState.eventsLibBase
+    for i = 1, #bases do
+        pcall(os.remove, path)
+        local done, success = false, false
+        local url = bases[i] .. name .. '?t=' .. tostring(os.time())
+        pcall(downloadUrlToFile, url, path, function(_, status)
+            if status == ds.STATUS_ENDDOWNLOADDATA or status == ds.STATUSEX_ENDDOWNLOAD then
+                done = true
+                success = true
+            end
+        end)
+        local t0 = os.clock()
+        while not done and os.clock() - t0 < 25 do wait(50) end
+        if success and scanState.eventsLibOk(name, '') then return true end
+        pcall(os.remove, path)
+    end
+    return false
+end
+
+function scanState.ensureEventsLib()
+    local files = scanState.eventsLibFiles
+    local need = false
+    for i = 1, #files do
+        if not scanState.eventsLibOk(files[i][1], files[i][2]) then
+            need = true
+            break
+        end
+    end
+    if not need then return false end
+    chat('Качаю arizona-events с GitHub AutoABarz…')
+    local okAll = true
+    for i = 1, #files do
+        local name, marker = files[i][1], files[i][2]
+        if not scanState.eventsLibOk(name, marker) then
+            if not scanState.downloadLibFile(name) or not scanState.eventsLibOk(name, marker) then
+                okAll = false
+            end
+        end
+    end
+    if not okAll then
+        chat('Не удалось скачать arizona-events. CEF будет ограничен.')
+        return false
+    end
+    chat('Библиотеки обновлены. Перезапуск скрипта…')
+    wait(300)
+    thisScript():reload()
+    return true
+end
+
+function scanState.loadArizonaEvents()
+    ok_arz, arz = pcall(require, 'arizona-events')
+    if not ok_arz then arz = nil end
+end
+scanState.logoPath = getWorkingDirectory() .. '\\images\\abarz-logo.png'
+
+function scanState.logoIsPng(path)
+    local f = io.open(path, 'rb')
+    if not f then return false end
+    local head = f:read(8)
+    local size = f:seek('end') or 0
+    f:close()
+    if not head or #head < 4 then return false end
+    return head:byte(1) == 137 and head:byte(2) == 80 and head:byte(3) == 78 and head:byte(4) == 71 and size > 1500
+end
+
+function scanState.loadLogoTex()
+    if scanState.logoTex then return end
+    if not scanState.logoIsPng(scanState.logoPath) then return end
+    local ok, tex = pcall(imgui.CreateTextureFromFile, scanState.logoPath)
+    if ok and tex then scanState.logoTex = tex end
+end
+
+function scanState.applyLogoPart()
+    local part = scanState.logoPath .. '.part'
+    if not scanState.logoIsPng(part) then
+        pcall(os.remove, part)
+        scanState.logoBusy = false
+        return
+    end
+    pcall(os.remove, scanState.logoPath)
+    if not os.rename(part, scanState.logoPath) then
+        pcall(function()
+            local src = io.open(part, 'rb')
+            local dst = io.open(scanState.logoPath, 'wb')
+            if src and dst then dst:write(src:read('*a')) end
+            if src then src:close() end
+            if dst then dst:close() end
+            os.remove(part)
+        end)
+    end
+    scanState.logoBusy = false
+    scanState.loadLogoTex()
+end
+
+function scanState.fetchLogo()
+    if scanState.logoBusy or scanState.logoFetched then return end
+    scanState.logoFetched = true
+    scanState.logoBusy = true
+    ensureDir(getWorkingDirectory() .. '\\images')
+    local part = scanState.logoPath .. '.part'
+    pcall(os.remove, part)
+    if type(downloadUrlToFile) ~= 'function' then
+        httpRequestAsync('GET', scanState.logoUrl, '', {
+            ['User-Agent'] = 'AutoABarz/logo',
+            ['Accept'] = 'image/png,image/*,*/*',
+        }, function(body, err)
+            scanState.logoBusy = false
+            if err or type(body) ~= 'string' or #body < 1500 then return end
+            if body:byte(1) ~= 137 or body:byte(2) ~= 80 or body:byte(3) ~= 78 or body:byte(4) ~= 71 then return end
+            pcall(function()
+                local f = io.open(part, 'wb')
+                if f then f:write(body) f:close() end
+            end)
+            scanState.applyLogoPart()
+        end, 20)
+        return
+    end
+    local ml = require('moonloader')
+    local ds = ml and ml.download_status
+    scanState.logoJob = { done = false, ok = false, t0 = os.clock() }
+    local job = scanState.logoJob
+    pcall(downloadUrlToFile, scanState.logoUrl, part, function(_, status)
+        if not ds or not job then return end
+        if status == ds.STATUS_ENDDOWNLOADDATA or status == ds.STATUSEX_ENDDOWNLOAD then
+            job.done = true
+            job.ok = true
+        end
+    end)
+end
+
+function scanState.pumpLogo()
+    local job = scanState.logoJob
+    if not job then return end
+    if job.done then
+        scanState.logoJob = nil
+        if job.ok then
+            scanState.applyLogoPart()
+        else
+            pcall(os.remove, scanState.logoPath .. '.part')
+            scanState.logoBusy = false
+        end
+        return
+    end
+    if os.clock() - (job.t0 or 0) > 25 then
+        scanState.logoJob = nil
+        pcall(os.remove, scanState.logoPath .. '.part')
+        scanState.logoBusy = false
+    end
+end
+
+function scanState.openForum()
+    local url = scanState.forumUrl
+    pcall(ffi.cdef, [[
+        void* __stdcall ShellExecuteA(void* hwnd, const char* op, const char* file,
+            const char* params, const char* dir, int show);
+    ]])
+    local opened = false
+    pcall(function()
+        ffi.load('Shell32').ShellExecuteA(nil, 'open', url, nil, nil, 1)
+        opened = true
+    end)
+    if not opened then
+        os.execute('cmd /c start "" "' .. url .. '"')
+    end
+end
+
 local function drawSidebar()
     imgui.BeginChild('##sidebar', imgui.ImVec2(SIDEBAR, WIN_H), false)
         local dl = imgui.GetWindowDrawList()
@@ -4057,23 +5305,38 @@ local function drawSidebar()
         local max = imgui.ImVec2(min.x + SIDEBAR, min.y + WIN_H)
         dl:AddRectFilled(min, max, u32(0.07, 0.08, 0.11, 1), 10)
         dl:AddRectFilled(min, imgui.ImVec2(min.x + 4, max.y), imgui.ColorConvertFloat4ToU32(accent()), 2)
-        spaced(0, 14)
-        imgui.SetCursorPosX(18)
-        imgui.PushStyleColor(imgui.Col.Text, accent())
-        imgui.Text('ABarz')
-        imgui.PopStyleColor()
-        imgui.SetCursorPosX(18)
-        imgui.TextDisabled('Arizona  •  v' .. tostring(thisScript().version))
-        spaced(0, 10)
+        if not scanState.logoKick then
+            scanState.logoKick = true
+            scanState.loadLogoTex()
+            scanState.fetchLogo()
+        end
+        local logoW = SIDEBAR - 20
+        local logoH = math.floor(logoW * 9 / 16)
+        imgui.SetCursorPos(imgui.ImVec2(10, 10))
+        if scanState.logoTex then
+            imgui.Image(scanState.logoTex, imgui.ImVec2(logoW, logoH))
+        end
+        imgui.SetCursorPos(imgui.ImVec2(14, 14 + logoH))
+        imgui.TextDisabled('v' .. tostring(thisScript().version))
+        imgui.SetCursorPosY(34 + logoH)
         for i, p in ipairs(PAGES) do
             imgui.SetCursorPosX(12)
             if navButton(p.title, page == i, SIDEBAR - 24) then page = i end
         end
-        imgui.SetCursorPos(imgui.ImVec2(12, WIN_H - 86))
+        imgui.SetCursorPos(imgui.ImVec2(12, WIN_H - 118))
         if navButton(chatOn[0] and 'Чат  ·  вкл' or 'Чат', chatOn[0], SIDEBAR - 24) then
             setChatEnabled(not chatOn[0])
         end
-        imgui.SetCursorPos(imgui.ImVec2(18, WIN_H - 40))
+        imgui.SetCursorPos(imgui.ImVec2(12, WIN_H - 80))
+        imgui.SetWindowFontScale(0.86)
+        if navButton('Тема на blast.hk', false, SIDEBAR - 24) then
+            scanState.openForum()
+        end
+        imgui.SetWindowFontScale(1.0)
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(scanState.forumUrl)
+        end
+        imgui.SetCursorPos(imgui.ImVec2(18, WIN_H - 28))
         imgui.TextDisabled('/abarz | /abprice')
     imgui.EndChild()
 end
@@ -4256,7 +5519,7 @@ end)
 end
 setupUi()
 
-local CMDS = { 'abarz', 'abscan', 'abchat', 'carprice', 'abupdate' }
+local CMDS = { 'abarz', 'abscan', 'abchat', 'abprice', 'carprice', 'abupdate' }
 
 local function unregisterCmds()
     for _, name in ipairs(CMDS) do
@@ -4265,21 +5528,18 @@ local function unregisterCmds()
 end
 
 function main()
-    local keepListed = false
-    pcall(function()
-        if isSampAvailable() and type(sampGetGamestate) == 'function' then
-            local gs = sampGetGamestate()
-            keepListed = type(gs) == 'number' and gs >= 3
-        end
-    end)
     while not isSampAvailable() do wait(0) end
+    if scanState.ensureEventsLib() then return end
+    scanState.loadArizonaEvents()
     loadPrices()
-    loadDealLogs(keepListed)
+    -- Сделки из файла — да. «На АБ» из файла — нет: при реконнекте скрипт часто
+    -- перезагружается ещё до onConnectionLost, а сервер лоты уже снял.
+    -- Лоты живут только в памяти текущей сессии скрипта (+ deals.json на дисконнекте чистим).
+    loadDealLogs(false)
+    forgetListed()
     pcall(scanState.loadSettings)
-    if not keepListed then
-        forgetListed()
-    end
     cleanupCurrencyNames()
+    pcall(carImg.loadVehiclesMap, false)
 
     unregisterCmds()
     saleAlive = true
@@ -4288,15 +5548,6 @@ function main()
         chat(('Бинд меню: %s  ·  чат: %s  (Скан -> Бинды)'):format(
             scanState.keyName(scanState.menuVk),
             scanState.chatBindOn[0] and scanState.keyName(scanState.chatVk) or 'выкл'))
-    end
-    if pendingSell.isActive() then
-        for i = 1, #pendingSell.lots do
-            local lot = pendingSell.lots[i]
-            chat(('На АБ помню %d/2: %s за %s'):format(
-                i,
-                (lot.model ~= '' and lot.model) or 'транспорт',
-                fmtMoney(lot.price)))
-        end
     end
     if not ok_arz then
         chat('Нет arizona-events (lib) — CEF будет ограничен')
@@ -4310,15 +5561,27 @@ function main()
     sampRegisterChatCommand('abchat', function()
         setChatEnabled(not chatOn[0])
     end)
-    sampRegisterChatCommand('carprice', function(arg)
+    local function cmdAbPrice(arg)
         arg = tostring(arg or ''):gsub('^%s+', ''):gsub('%s+$', '')
         if arg == '' then
-            chat('Использование: /carprice [название]')
+            chat('Использование: /abprice [название]')
             return
         end
         rebuildList()
         local rows = findPrices(arg)
         if #rows == 0 then
+            local avg, matched = resolveAvgForModel(arg)
+            if avg and matched then
+                local info = prices[matched]
+                chat(('%s → %s — средняя %s, дней: %d'):format(
+                    normalizeName(arg), matched, fmtMoney(avg), info and #(info.days or {}) or 0))
+                if info and info.days then
+                    for j = 1, math.min(3, #info.days) do
+                        chat(('   %s: %s'):format(info.days[j].date, fmtMoney(info.days[j].price)))
+                    end
+                end
+                return
+            end
             chat('Не найдено: ' .. arg)
             return
         end
@@ -4332,7 +5595,9 @@ function main()
                 end
             end
         end
-    end)
+    end
+    sampRegisterChatCommand('abprice', cmdAbPrice)
+    sampRegisterChatCommand('carprice', cmdAbPrice)
 
     sampRegisterChatCommand('abupdate', function()
         scanState.checkUpdate(true)
@@ -4362,11 +5627,14 @@ function main()
             startScan()
         end
         pcall(scanState.pumpHttpJobs)
+        pcall(scanState.pumpLogo)
         pcall(drainHttpCbQueue)
         pcall(pumpSales)
+        pcall(scanState.mark.pump)
         pcall(pumpCefDialog)
         pcall(pumpScanFab)
         pcall(pumpPassportOverlay)
+        pcall(carImg.pump)
         pcall(scanState.pumpBinds)
         pcall(function()
             if scanState.pricesDirty and os.clock() >= (scanState.saveAt or 0) then
@@ -4382,9 +5650,26 @@ function onScriptTerminate(s)
         chatOn[0] = false
         unregisterCmds()
         stopSaleWatch()
+        pcall(scanState.mark.release)
         rebuildList()
         savePrices()
+        -- не сохранять лоты, если уже дисконнект / помечен сброс
+        if pendingSell.dropListed then
+            pendingSell.lots = {}
+            pendingSell.dropListed = false
+        else
+            pcall(function()
+                if not pendingSell.inWorld() then
+                    pendingSell.lots = {}
+                end
+            end)
+        end
         saveDealLogs()
         pcall(scanState.saveSettings)
+        pcall(function()
+            for _, slot in pairs(carImg.slots) do
+                carImg.releaseSlot(slot)
+            end
+        end)
     end
 end
