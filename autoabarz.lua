@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.7.0')
+script_version('1.8.0')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -28,9 +28,11 @@ local ok_cef, cefDlg = pcall(require, 'arizona-cef-dialogs')
 if not ok_cef then cefDlg = nil end
 local ok_ev, ev = pcall(require, 'samp.events')
 if not ok_ev then ok_ev, ev = pcall(require, 'lib.samp.events') end
+local ok_ntfy, ntfy = pcall(require, 'notifications')
+if not ok_ntfy then ntfy = nil end
 
 local new = imgui.new
-local TAG = '{5B8CFF}[] {FFFFFF}'
+local noticeLogo = getWorkingDirectory() .. '\\images\\abarz-logo.png'
 
 local function is_valid_utf8(s)
     if type(s) ~= 'string' then return false end
@@ -101,10 +103,22 @@ local function d(text)
     return (ok and out) or text
 end
 
-local function chat(msg)
-    if isSampAvailable() then
-        sampAddChatMessage(TAG .. d(tostring(msg)), -1)
+local function chat(msg, kind)
+    local text = repair_mojibake(ensure_utf8(tostring(msg))):gsub('{%x%x%x%x%x%x}', '')
+    kind = kind or 'info'
+    if ntfy and type(ntfy.show) == 'function' then
+        local ok, note = pcall(ntfy.show, text, kind, kind == 'error' and 12000 or 8000)
+        if ok then
+            if type(note) == 'table' then
+                note.title = 'AutoABarz'
+                note.icon_path = noticeLogo
+                note.icon_uv = {0.065, 0.25, 0.955, 0.69}
+            end
+            return
+        end
     end
+    -- Library failure must not crash a scan or put service messages back in game chat.
+    print('AutoABarz [' .. kind .. ']: ' .. text)
 end
 
 local function ensureDir(path)
@@ -113,13 +127,20 @@ end
 
 -- Корневой массив ([] / [{...}]) в decodeJson не отдаём: MoonLoader 0.26.5 cjson AV, pcall не ловит
 local function safeDecodeJson(raw)
-    if type(raw) ~= 'string' or type(decodeJson) ~= 'function' then return false, nil end
+    if type(raw) ~= 'string' then return false, nil end
     local s = raw:gsub('^%s+', ''):gsub('%s+$', '')
-    if s == '' or s == 'null' then return false, nil end
-    if s:sub(1, 1) ~= '{' then return false, nil end
-    local ok, data = pcall(decodeJson, s)
-    if not ok or data == nil then return false, nil end
-    return true, data
+    local first = s:sub(1,1)
+    if first ~= '{' and first ~= '[' then return false, nil end
+    local okModule, json = pcall(require, 'json')
+    local decoder = okModule and type(json) == 'table' and json.decode or decodeJson
+    if type(decoder) ~= 'function' then return false, nil end
+    -- Native MoonLoader decoders may reject root arrays. Wrap, never pass
+    -- an array to that decoder, and leave the global decoder untouched.
+    local wrapped = first == '['
+    if wrapped then s = '{"data":' .. s .. '}' end
+    local ok, data = pcall(decoder, s)
+    if not ok or type(data) ~= 'table' then return false, nil end
+    return true, wrapped and data.data or data
 end
 
 local DATA_DIR = getWorkingDirectory() .. '\\config\\abarz'
@@ -131,8 +152,7 @@ local incomingChat = {}
 local incomingDlg = {}
 local incomingCef = {}
 local pendingBuy = { active = false, model = '', price = 0, t = 0, source = '' }
-local pendingSell = { lots = {}, max = 2, draftModel = '', muteNtfy = 0, awaitSell = 0 }
-local needBuySnapshot = false
+local pendingSell = { lots = {}, max = 2, draftModel = '', muteNtfy = 0, confirmations = {}, sequence = 0, details = {} }
 local needSellSnapshot = false
 ensureDir(DATA_DIR)
 
@@ -222,7 +242,7 @@ local function cleanPriceNum(v)
         v = v:gsub('%s+', ''):gsub('%$', ''):gsub('%.', ''):gsub(',', '')
     end
     v = tonumber(v)
-    if not v or v <= 0 or v > 2147483647 then return nil end
+    if not v or v ~= v or v <= 0 or v > 9007199254740991 then return nil end
     return math.floor(v)
 end
 
@@ -419,6 +439,8 @@ local function loadPrices()
     rebuildList()
 end
 
+local savePrices
+
 -- один раз чистим старые "Firebird\t:CASH"
 local function cleanupCurrencyNames()
     local changed = false
@@ -449,7 +471,7 @@ local function cleanupCurrencyNames()
     end
 end
 
-local function savePrices()
+savePrices = function()
     ensureDir(DATA_DIR)
     local f = io.open(DATA_FILE, 'w')
     if not f then return end
@@ -590,15 +612,38 @@ local function importPricesFromText(raw)
     return added, nil
 end
 
+function scanState.writeJsonFile(path, value)
+    local ok, encoded=pcall(encodeJson,value)
+    if not ok then return false,tostring(encoded) end
+    local temp,backup=path..'.tmp',path..'.bak'
+    local f,err=io.open(temp,'wb')
+    if not f then return false,err end
+    local wrote,writeError=f:write(encoded)
+    local closed,closeError=f:close()
+    if not wrote or not closed then return false,writeError or closeError end
+    local old=io.open(path,'rb')
+    if old then
+        old:close()
+        os.remove(backup)
+        local moved,why=os.rename(path,backup)
+        if not moved then return false,why end
+    end
+    local moved,why=os.rename(temp,path)
+    if not moved then
+        if old then os.rename(backup,path) end
+        return false,why
+    end
+    return true
+end
+
 local function saveDealLogs()
     ensureDir(DATA_DIR)
-    local f = io.open(LOGS_FILE, 'w')
-    if not f then return end
     local listed = {}
     for i = 1, #(pendingSell.lots or {}) do
         local lot = pendingSell.lots[i]
         if type(lot) == 'table' and tonumber(lot.price) and lot.price > 0 then
             listed[#listed + 1] = {
+                id = lot.id,
                 model = tostring(lot.model or ''),
                 price = lot.price,
                 at = tonumber(lot.at) or os.time(),
@@ -606,8 +651,16 @@ local function saveDealLogs()
             }
         end
     end
-    f:write(encodeJson({ version = 3, deals = dealLogs, listed = listed, saved_at = os.time() }))
-    f:close()
+    local unresolved = {}
+    for _, entry in ipairs(pendingSell.confirmations) do
+        if entry.state == 'waiting' or entry.state == 'unresolved' then unresolved[#unresolved+1] = entry end
+    end
+    local ok,err=scanState.writeJsonFile(LOGS_FILE,{version=4,deals=dealLogs,listed=listed,unresolved=unresolved,saved_at=os.time()})
+    if not ok and not pendingSell.saveErrorNotified then
+        chat('Не удалось сохранить сделки: '..tostring(err or 'ошибка записи'), 'error')
+    end
+    pendingSell.saveErrorNotified=not ok
+    return ok
 end
 
 -- Arizona снимает лоты с АБ при кике/дисконнекте/переподключении.
@@ -615,7 +668,6 @@ end
 local function forgetListed()
     pendingSell.lots = {}
     pendingSell.dropListed = false
-    pendingSell.awaitSell = 0
     pendingSell.draftModel = ''
     saveDealLogs()
 end
@@ -638,6 +690,7 @@ local function ingestListedRow(row)
     if price <= 0 or at <= 0 or (os.time() - at) >= 43200 then return end
     pendingSell.lots = pendingSell.lots or {}
     pendingSell.lots[#pendingSell.lots + 1] = {
+        id = row.id or pendingSell.newId('lot'),
         model = tostring(row.model or ''),
         price = price,
         source = tostring(row.source or 'saved'),
@@ -652,20 +705,23 @@ end
 local function loadDealLogs(keepListed)
     dealLogs = {}
     pendingSell.lots = {}
-    if not doesFileExist(LOGS_FILE) then
-        return
+    pendingSell.confirmations = {}
+    local data
+    for _,path in ipairs({LOGS_FILE,LOGS_FILE..'.tmp',LOGS_FILE..'.bak'}) do
+        local f=io.open(path,'rb')
+        if f then
+            local raw=f:read('*a'); f:close()
+            local ok,decoded=safeDecodeJson(raw)
+            if ok and type(decoded)=='table' then data=decoded; break end
+        end
     end
-    local f = io.open(LOGS_FILE, 'r')
-    if not f then return end
-    local raw = f:read('*a')
-    f:close()
-    local ok, data = safeDecodeJson( raw)
-    if not ok or type(data) ~= 'table' then return end
+    if not data then return end
     local src = data.deals or data
     if type(src) == 'table' then
         for _, row in ipairs(src) do
             if type(row) == 'table' then
                 dealLogs[#dealLogs + 1] = {
+                    id = row.id,
                     action = tostring(row.action or 'buy'),
                     model = tostring(row.model or 'Транспорт'),
                     price = tonumber(row.price) or 0,
@@ -673,6 +729,13 @@ local function loadDealLogs(keepListed)
                     source = tostring(row.source or ''),
                 }
             end
+        end
+    end
+    pendingSell.confirmations = {}
+    for _, entry in ipairs(type(data.unresolved) == 'table' and data.unresolved or {}) do
+        if type(entry) == 'table' and (entry.action == 'buy' or entry.action == 'sell') then
+            entry.state = 'unresolved'
+            pendingSell.confirmations[#pendingSell.confirmations+1] = entry
         end
     end
     if keepListed then
@@ -978,19 +1041,13 @@ end
 -- CEF: arizona-cef-dialogs (RPC 61) + arizona-events.
 ---------------------------------------------------------------------------
 local function classifyDialog(id, title, text)
-    title = stripColors(ensure_utf8(tostring(title or '')))
+    title = stripColors(ensure_utf8(tostring(title or ''))):gsub('^%s+', '')
     text = ensure_utf8(tostring(text or ''))
-    id = tonumber(id) or 0
-    if id == DIALOG_LIST_ID or title:find('Средняя цена автомобилей', 1, true) then
-        return 'list'
-    end
-    if id == DIALOG_DAYS_ID then
-        return 'days'
-    end
-    if title:find('Продажа транспорта', 1, true)
+    if title:find('Средняя цена автомобилей', 1, true) == 1 then return 'list' end
+    if title:find('Продажа транспорта', 1, true) == 1
         and (text:find('Средняя цена за день', 1, true)
-            or text:find('Количество продаж', 1, true))
-    then
+            or text:find('Количество продаж', 1, true)
+            or text:find('За последние 30 дней не найдено ни одной продажи этого транспорта', 1, true)) then
         return 'days'
     end
     return 'other'
@@ -1105,8 +1162,8 @@ end
 
 local function ingestDialog(id, style, title, btn1, btn2, text)
     local kind = classifyDialog(id, title, text)
-    local finger = tostring(tonumber(id) or 0) .. '\1' .. tostring(kind) .. '\1' .. tostring(#(text or ''))
-    if finger == (scanState.lastFinger or '') and not scanState.forceDlg then
+    local finger = table.concat({tostring(id),tostring(style),tostring(title),tostring(text)}, '\1')
+    if finger == (scanState.lastFinger or '') then
         if kind == 'list' then scanState.listUntil = os.clock() + 4 end
         return scanState.dlg
     end
@@ -1177,7 +1234,7 @@ local function drainScanDialogs()
         incomingDlg = {}
         for i = 1, #batch do
             local d = batch[i]
-            pcall(ingestDialog, d.id, d.style, d.title, d.btn1, d.btn2, d.text)
+            pcall(scanState.consumeDialog or ingestDialog, d.id, d.style, d.title, d.btn1, d.btn2, d.text)
         end
     end
     if not (ok_cef and cefDlg) then return end
@@ -1189,7 +1246,7 @@ local function drainScanDialogs()
         if title == '' and text == '' then return end
         local kind = classifyDialog(id, title, text)
         if kind == 'list' or kind == 'days' then
-            ingestDialog(id, cefDlg.GetStyle(), title, cefDlg.GetButton1(), cefDlg.GetButton2(), text)
+            (scanState.consumeDialog or ingestDialog)(id, cefDlg.GetStyle(), title, cefDlg.GetButton1(), cefDlg.GetButton2(), text)
         end
     end)
 end
@@ -1211,12 +1268,13 @@ local function waitForDialog(kind, timeoutMs, minSeq)
     end
     pcall(drainScanDialogs)
     local d = scanState.dlg
-    if d and d.kind == kind then return d end
+    if d and d.kind == kind and (tonumber(d.seq) or 0) > minSeq then return d end
     return nil
 end
 
 -- Быстрый «Назад»: native close + короткий poll, один fallback RESP.
 local function backToList(timeoutMs)
+    if not scanState.active then return false end
     timeoutMs = timeoutMs or 400
 
     local function haveList()
@@ -1234,6 +1292,7 @@ local function backToList(timeoutMs)
         pcall(cefDlg.CloseWithButton, 1)
         if waitForDialog('list', timeoutMs, startSeq) then return true end
         if haveList() then return true end
+        if not scanState.active then return false end
         startSeq = scanState.dlgSeq or 0
     end
     scanState.forceDlg = true
@@ -1241,12 +1300,14 @@ local function backToList(timeoutMs)
         pcall(sampCloseCurrentDialogWithButton, 1)
         if waitForDialog('list', timeoutMs, startSeq) then return true end
         if haveList() then return true end
+        if not scanState.active then return false end
     end
 
     startSeq = scanState.dlgSeq or 0
     dialogResponse(daysId, 1, 0, '')
     if waitForDialog('list', timeoutMs, startSeq) then return true end
     if haveList() then return true end
+    if not scanState.active then return false end
 
     startSeq = scanState.dlgSeq or 0
     dialogResponse(daysId, 1, -1, '')
@@ -1264,7 +1325,7 @@ local function openCarDays(listId, car, nextIdx, prevIdx)
     nextIdx = nextIdx or 2
     prevIdx = prevIdx or 1
     local idx = tonumber(car.idx)
-    if not idx or idx < 3 or idx == nextIdx or idx == prevIdx then
+    if not idx or idx < 0 then
         return nil, nil
     end
     if not (scanState.dlg and scanState.dlg.kind == 'list') then
@@ -1275,9 +1336,6 @@ local function openCarDays(listId, car, nextIdx, prevIdx)
     dialogResponse(listId, 1, idx, '')
     clickDelay()
     local daysDlg = waitForDialog('days', 700, seqBefore)
-    if not daysDlg and scanState.dlg and scanState.dlg.kind == 'days' then
-        daysDlg = scanState.dlg
-    end
     if daysDlg then
         return daysDlg, idx
     end
@@ -1340,12 +1398,11 @@ end
 
 local function startScan()
     if scanState.active then
-        chat('Скан уже идёт...')
         return
     end
 
     if not (scanState.dlg and scanState.dlg.kind == 'list') then
-        chat('Сначала открой диалог «Средняя цена автомобилей…»')
+        chat('Сначала открой диалог «Средняя цена автомобилей…»', 'warning')
         return
     end
 
@@ -1353,7 +1410,6 @@ local function startScan()
     scanState.stopped = false
     scanState.index = 0
     scanState.currentName = nil
-    chat('Скан запущен')
 
     lua_thread.create(function()
         local page = 0
@@ -1365,7 +1421,7 @@ local function startScan()
                 list = waitForDialog('list', 4000, scanState.dlgSeq or 0)
             end
             if not list or list.kind ~= 'list' then
-                chat('Нет списка — стоп')
+                chat('Нет списка — стоп', 'error')
                 break
             end
 
@@ -1380,7 +1436,6 @@ local function startScan()
             local firstName = pageCars[1] and pageCars[1].name or ''
             page = page + 1
             scanState.index = page
-            chat(('Стр.%d: %d машин'):format(page, #pageCars))
 
             if firstName ~= '' and seenFirst[firstName] then
                 break
@@ -1397,7 +1452,7 @@ local function startScan()
                 if not carHasToday(car.name) then
                     if scanState.dlg and scanState.dlg.kind == 'days' then
                         if not backToList(500) then
-                            chat('Не могу нажать Назад — стоп.')
+                            chat('Не могу нажать Назад — стоп.', 'error')
                             scanState.active = false
                             break
                         end
@@ -1415,7 +1470,7 @@ local function startScan()
                     local daysDlg = openCarDays(listId, car, nextIdx, prevIdx)
                     if daysDlg then
                         if not backToList(500) then
-                            chat('Назад из дней не сработал. Стоп.')
+                            chat('Назад из дней не сработал. Стоп.', 'error')
                             scanState.active = false
                             break
                         end
@@ -1446,9 +1501,6 @@ local function startScan()
         scanState.active = false
         rebuildList()
         savePrices()
-        if not scanState.stopped then
-            chat(('Скан готов. Машин в базе: %d'):format(#priceList))
-        end
     end)
 end
 
@@ -1458,7 +1510,6 @@ local function stopScan()
     scanState.stopped = true
     rebuildList()
     savePrices()
-    chat('Скан остановлен')
 end
 
 -- Тот же канал, что у кнопки «Закрыть» в CEF-диалоге (не HUD, как ПТС)
@@ -1478,80 +1529,62 @@ local function evalCefDialog(code)
 end
 
 local function priceMenuOpen()
+    if type(sampIsDialogActive) == 'function' and not sampIsDialogActive() then return false end
+    if scanState.currentDialog then return scanState.currentDialog.kind == 'list' end
     if ok_cef and cefDlg then
-        local id, title, text = -1, '', ''
-        pcall(function()
-            id = tonumber(cefDlg.GetId()) or -1
-            title = cefDlg.GetTitle() or ''
-            text = cefDlg.GetDialogText() or ''
+        local ok, kind = pcall(function()
+            return classifyDialog(cefDlg.GetId(), cefDlg.GetTitle(), cefDlg.GetDialogText())
         end)
-        if classifyDialog(id, title, text) == 'list' then return true end
+        return ok and kind == 'list'
     end
-    return scanState.dlg and scanState.dlg.kind == 'list'
+    return false
 end
 
 local function injectScanButton()
-    -- Ищем список по тексту внутри окна, не по первому попавшемуся .dialog
     evalCefDialog([[
 var id='abarz-scan-btn';
-var needles=['\u0421\u0440\u0435\u0434\u043d\u044f\u044f \u0446\u0435\u043d\u0430 \u0430\u0432\u0442\u043e\u043c\u043e\u0431\u0438\u043b\u0435\u0439','\u041f\u043e\u0438\u0441\u043a \u043f\u043e \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u044e','\u043e\u0438\u0441\u043a \u043f\u043e \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u044e','\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u0430'];
-var skip='\u0446\u0435\u043d\u0430 \u0437\u0430 \u0434\u0435\u043d\u044c';
-function hit(s){
-  if(!s) return false;
-  if(s.indexOf(skip)!==-1) return false;
-  for(var i=0;i<needles.length;i++) if(s.indexOf(needles[i])!==-1) return true;
-  return false;
-}
-var box=null;
-var nodes=document.querySelectorAll('.dialog');
-for(var i=0;i<nodes.length;i++){
-  if(hit(nodes[i].innerText||nodes[i].textContent||'')){ box=nodes[i]; break; }
-}
-if(!box){
-  var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
-  var n, host=null;
-  while(n=w.nextNode()){
-    if(hit(n.nodeValue||'')){ host=n.parentElement; break; }
+var title='Средняя цена автомобилей';
+function priceDialog(){
+  var nodes=document.querySelectorAll('.dialog');
+  for(var i=0;i<nodes.length;i++){
+    var box=nodes[i];
+    if(!box.getClientRects().length) continue;
+    var header=box.querySelector('.dialog__header');
+    var t=String((header||box).innerText||(header||box).textContent||'').trim();
+    if(t.indexOf(title)===0) return box;
   }
-  if(host){
-    var p=host;
-    for(var i=0;i<16&&p;i++){
-      var cn=(p.className&&(p.className.baseVal||p.className))||'';
-      if(String(cn).indexOf('dialog')!==-1){ box=p; break; }
-      p=p.parentElement;
-    }
-    if(!box) box=host;
-  }
+  return null;
 }
-var old=document.getElementById(id);
-if(!box){ if(old) old.remove(); return; }
-if(old){
-  if(!box.contains(old)) old.remove();
-  else return;
+function refresh(){
+  var box=priceDialog(), old=document.getElementById(id);
+  if(!box){ if(old) old.remove(); window.__abarzScan=null; return; }
+  if(old){ if(box.contains(old)) return; old.remove(); }
+  var btn=document.createElement('div');
+  btn.id=id; btn.textContent='Сканировать';
+  btn.onclick=function(ev){
+    ev.preventDefault(); ev.stopPropagation();
+    if(priceDialog()!==box) return;
+    window.__abarzScan='start';
+    try{ if(window.cef&&window.cef.SendMessage) window.cef.SendMessage('abarz-scan|start',0); }catch(e){}
+  };
+  btn.style.cssText='width:100%;margin:8px 0 4px;padding:10px 14px;text-align:center;font-size:15px;font-weight:700;color:#fff;background:#27ae60;border-radius:8px;cursor:pointer;box-sizing:border-box;';
+  box.appendChild(btn);
 }
-var btn=document.createElement('div');
-btn.id=id;
-btn.textContent='\u0421\u043a\u0430\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c';
-btn.onclick=function(ev){
-  if(ev){ ev.preventDefault(); ev.stopPropagation(); }
-  window.__abarzScan='start';
-  try{ if(window.cef&&window.cef.SendMessage) window.cef.SendMessage('abarz-scan|start',0); }catch(e){}
-};
-btn.style.cssText='width:100%;margin:8px 0 4px;padding:10px 14px;text-align:center;font-size:15px;font-weight:700;color:#fff;letter-spacing:.03em;box-sizing:border-box;background:#27ae60;border-radius:8px;cursor:pointer;';
-var header=box.querySelector('.dialog__header');
-if(header&&header.parentNode) header.parentNode.insertBefore(btn, header.nextSibling);
-else box.insertBefore(btn, box.firstChild);
+if(window.__abarzScanObserver) window.__abarzScanObserver.disconnect();
+window.__abarzScanObserver=new MutationObserver(refresh);
+window.__abarzScanObserver.observe(document.body,{childList:true,subtree:true,characterData:true});
+refresh();
 ]])
 end
 
 local function pumpScanFab()
     if scanFab.cmd == 'start' then
         scanFab.cmd = ''
-        if not scanState.active then requestScan() end
+        if priceMenuOpen() and not scanState.active then requestScan() end
     end
     if not priceMenuOpen() then
         if scanFab.wasOpen then
-            evalCefDialog([[var e=document.getElementById('abarz-scan-btn'); if(e) e.remove();]])
+            evalCefDialog([[var e=document.getElementById('abarz-scan-btn'); if(e) e.remove(); window.__abarzScan=null; if(window.__abarzScanObserver) window.__abarzScanObserver.disconnect();]])
         end
         scanFab.wasOpen = false
         return
@@ -1576,9 +1609,8 @@ pcall(function()
     addEventHandler('onSendPacket', function(id, bs)
         if id ~= 220 then return end
         local act
+        local off = raknetBitStreamGetReadOffset and raknetBitStreamGetReadOffset(bs)
         pcall(function()
-            local off
-            if raknetBitStreamGetReadOffset then off = raknetBitStreamGetReadOffset(bs) end
             if raknetBitStreamSetReadOffset then raknetBitStreamSetReadOffset(bs, 0) end
             raknetBitStreamIgnoreBits(bs, 8)
             local pType = raknetBitStreamReadInt8(bs)
@@ -1587,8 +1619,8 @@ pcall(function()
                 local text = raknetBitStreamReadString(bs, len)
                 if type(text) == 'string' then act = text:match('abarz%-scan%|(%w+)') end
             end
-            if off and raknetBitStreamSetReadOffset then raknetBitStreamSetReadOffset(bs, off) end
         end)
+        if off and raknetBitStreamSetReadOffset then raknetBitStreamSetReadOffset(bs, off) end
         if act == 'start' then
             scanFab.cmd = act
             return false
@@ -1732,6 +1764,7 @@ scanState.mark = {
     expires = 0,
     modelReady = false,
     pendingShort = {},
+    objects = {},
 }
 
 function scanState.mark.turboOf(text)
@@ -1754,7 +1787,8 @@ end
 function scanState.mark.objectHandle(sampId)
     sampId = tonumber(sampId)
     if not sampId or type(sampGetObjectHandleBySampId) ~= 'function' then return end
-    local ok, handle = pcall(sampGetObjectHandleBySampId, sampId)
+    local ok, a, b = pcall(sampGetObjectHandleBySampId, sampId)
+    local handle = type(a) == 'number' and a or (a == true and b or nil)
     if not ok or type(handle) ~= 'number' or handle <= 0 then return end
     if type(doesObjectExist) == 'function' then
         local okE, exists = pcall(doesObjectExist, handle)
@@ -1764,60 +1798,56 @@ function scanState.mark.objectHandle(sampId)
 end
 
 function scanState.mark.isSign(sampId)
+    local object=scanState.mark.objects[tonumber(sampId)]
+    if object then return object.model == scanState.mark.abModel end
     local handle = scanState.mark.objectHandle(sampId)
     if not handle or type(getObjectModel) ~= 'function' then return false end
     local ok, model = pcall(getObjectModel, handle)
     return ok and tonumber(model) == scanState.mark.abModel
 end
 
+function scanState.mark.validModel(name)
+    name = normalizeName(name)
+    if name == '' or name:find('***',1,true) or name:find(':',1,true) then return false end
+    if name:match('^%[?%d+%]?$') or name:match('^[%w]+_[%w_]+') then return false end
+    if name:lower():match('^id%s') or name:lower():match('^id#') then return false end
+    if name:find('Владел',1,true) or name:find('Продавец',1,true)
+        or name:find('Текущая ставка',1,true) or name:find('Состояние',1,true)
+        or name:find('Продажа',1,true) or name:find('Аукцион',1,true) then return false end
+    if name:lower() == 'twin turbo' or name:lower() == 'twinturbo' then return false end
+    return name:find('[%a\128-\255]') ~= nil
+end
+
 function scanState.mark.parseShort(text)
     text = scanState.mark.clean(text)
-    if text == '' then return nil end
     local lines = {}
     for line in text:gmatch('[^\n]+') do
-        line = line:gsub('^%s+', ''):gsub('%s+$', '')
-        if line ~= '' then lines[#lines + 1] = line end
+        line = line:gsub('^%s+',''):gsub('%s+$','')
+        if line ~= '' then lines[#lines+1] = line end
     end
     if #lines < 2 then return nil end
-    local price, priceAt
-    for i = 1, #lines do
-        local p = parsePlatePrice(lines[i])
-        if p and p >= 1000000 and (not price or p > price) then
-            price, priceAt = p, i
-        end
+    if lines[1]:find('Аукцион №',1,true) == 1 and scanState.mark.validModel(lines[2]) then
+        return 'auction',normalizeName(lines[2]),nil,nil
     end
-    if not price then return nil end
-    local vehicle
-    for i = 1, #lines do
-        if i ~= priceAt then
-            local name = normalizeName(lines[i])
-            local low = name:lower()
-            if name ~= '' and not name:find('***', 1, true)
-                and low ~= 'twin turbo' and low ~= 'twinturbo'
-                and not name:find('Продажа', 1, true)
-                and not name:find('Аукцион', 1, true)
-                and not name:find('Цена', 1, true)
-                and not name:find('Владел', 1, true)
-                and not name:find('Состояние', 1, true)
-            then
-                vehicle = name
-                break
+    local index = lines[1] == 'Продажа транспорта' and 2 or 1
+    local model = lines[index]
+    if not scanState.mark.validModel(model) then return nil end
+    for i=index+1,math.min(#lines,index+3) do
+        local line = lines[i]
+        if line:find('Владел',1,true) or line:lower():find('id:',1,true) then return nil end
+        if line:lower() ~= 'twin turbo' and line:lower() ~= 'twinturbo' then
+            local price = parsePlatePrice(line)
+            if price and price >= 5001 then
+                return 'sale',normalizeName(model),price,scanState.mark.turboOf(text)
             end
+            return nil
         end
     end
-    if not vehicle then return nil end
-    return 'sale', vehicle, price, scanState.mark.turboOf(text)
+    return nil
 end
 
 function scanState.mark.looksLikePlate(text)
-    text = repair_mojibake(ensure_utf8(tostring(text or '')))
-    local s = text:lower()
-    if s:find('twin turbo', 1, true) or s:find('twinturbo', 1, true) then return true end
-    if text:find('Продажа транспорта', 1, true) or text:find('Цена:', 1, true) then return true end
-    if text:find('Аукцион №', 1, true) then return true end
-    local lines = 0
-    for _ in s:gmatch('[^\n]+') do lines = lines + 1 end
-    return lines >= 3 and s:find('%d[%d%.]*%d') ~= nil
+    return scanState.mark.parseShort(text) ~= nil
 end
 
 function scanState.mark.holdShort(sampId, key, text, x, y, z)
@@ -1839,7 +1869,7 @@ local function parseSalePlate(text)
     local auc = text:match('Аукцион №%d+\n([^\n]+)')
     if auc then
         auc = normalizeName(auc)
-        if auc ~= '' and not auc:find('***', 1, true) then
+        if scanState.mark.validModel(auc) then
             return 'auction', auc, nil, nil
         end
     end
@@ -1858,7 +1888,7 @@ local function parseSalePlate(text)
     if not model then
         model, priceStr = text:match('([^\n]+)\t+:CASH:([^\n]+)')
     end
-    if not model or model:find('***', 1, true) then return nil end
+    if not model or not scanState.mark.validModel(model) then return nil end
     model = normalizeName(model)
     if model == '' or not priceStr then return nil end
     local price = parsePlatePrice(priceStr)
@@ -1899,11 +1929,49 @@ end
 
 local function notifyNewSale(kind, model, price, turbo)
     if kind == 'auction' then
-        chat(('Новый транспорт на аукционе: %s'):format(model))
+        local msg = ('Новый транспорт на аукционе: %s'):format(model)
+        chat(msg)
         return
     end
-    local tt = (turbo == 'Twin Turbo') and '{FF69B4}ТТ' or '{A0A0A0}Без ТТ'
+
     local avg, avgName = resolveAvgForModel(model)
+    local ttPlain = (turbo == 'Twin Turbo') and 'ТТ' or 'Без ТТ'
+    local tt = (turbo == 'Twin Turbo') and '{FF69B4}ТТ' or '{A0A0A0}Без ТТ'
+    local plain
+    if not avg then
+        plain = ('На продаже: %s за %s | средняя неизвестна | %s'):format(
+            model, fmtMoney(price), ttPlain)
+    else
+        local avgLabel = (avgName and avgName ~= model)
+            and (('средняя %s (%s)'):format(fmtMoney(avg), avgName))
+            or (('средняя %s'):format(fmtMoney(avg)))
+        local gain = avg - (tonumber(price) or 0)
+        if gain > 15000000 then
+            local vs = vsAvgInfo(price, avg)
+            local how = (vs.title == 'Дороже средней') and 'Дороже' or 'Дешевле'
+            local detail = (vs.detail or ''):gsub('%%', '')
+            plain = ('На продаже: %s за %s | %s | %s %s | %s'):format(
+                model, fmtMoney(price), avgLabel, how, detail, ttPlain)
+        else
+            plain = ('На продаже: %s за %s | %s | %s'):format(
+                model, fmtMoney(price), avgLabel, ttPlain)
+        end
+    end
+
+    if ntfy and ntfy.sale then
+        local ok = pcall(ntfy.sale, {
+            model = model,
+            price = price,
+            avg = avg,
+            turbo = turbo,
+            text = plain,
+            title = 'AutoABarz',
+            icon_path = noticeLogo,
+            icon_uv = {0.065, 0.25, 0.955, 0.69},
+        })
+        if ok then return end
+    end
+
     if not avg then
         chat(('На продаже: %s за %s | средняя неизвестна | %s'):format(
             model, fmtMoney(price), tt))
@@ -1926,18 +1994,16 @@ local function notifyNewSale(kind, model, price, turbo)
 end
 
 local function tryObjectPos(sampId)
-    sampId = tonumber(sampId)
-    if not sampId or type(sampGetObjectHandleBySampId) ~= 'function' then return end
-    local ok, handle = pcall(sampGetObjectHandleBySampId, sampId)
-    if not ok or type(handle) ~= 'number' or handle <= 0 then return end
-    local ok2, a, b, c, d = pcall(getObjectCoordinates, handle)
-    if not ok2 then return end
-    if type(b) == 'number' and type(c) == 'number' and type(d) == 'number' then
-        return b, c, d
+    local object=scanState.mark.objects[tonumber(sampId)]
+    local handle=scanState.mark.objectHandle(sampId)
+    if handle and type(getObjectCoordinates) == 'function' then
+        local ok,a,b,c,d=pcall(getObjectCoordinates,handle)
+        if ok then
+            if type(b)=='number' and type(c)=='number' and type(d)=='number' then return b,c,d end
+            if type(a)=='number' and type(b)=='number' and type(c)=='number' then return a,b,c end
+        end
     end
-    if type(a) == 'number' and type(b) == 'number' and type(c) == 'number' then
-        return a, b, c
-    end
+    if object then return object.x,object.y,object.z end
 end
 
 local function playerPos()
@@ -2066,9 +2132,10 @@ function scanState.mark.release()
     scanState.mark.modelReady = false
 end
 
-local function rememberPlate(key, model, price, x, y, z)
+local function rememberPlate(key, model, price, x, y, z, owner)
     if not key or not model or not price then return end
     knownPlates[key] = {
+        owner = owner,
         model = model,
         price = price,
         x = tonumber(x), y = tonumber(y), z = tonumber(z),
@@ -2154,7 +2221,7 @@ local function modelsMatchForLot(plateModel, ptsModel)
     return false, 0
 end
 
-scanState.findLot = function(model)
+scanState.findLot = function(model, owner)
     model = normalizeName(model)
     if model == '' then return nil end
     local now = os.clock()
@@ -2164,7 +2231,8 @@ scanState.findLot = function(model)
     local best -- { price, score, dist, t, plateModel }
     for _, row in pairs(knownPlates) do
         local p = tonumber(row.price) or 0
-        if p >= 1000000 and (now - (row.t or 0)) < 90 then
+        if p > 0 and (not owner or not row.owner or row.owner == owner)
+            and ((row.objectId and scanState.mark.objects[row.objectId]) or (now - (row.t or 0)) < 90) then
             local ok, score = modelsMatchForLot(row.model, model)
             if ok then
                 local d = nil
@@ -2238,60 +2306,38 @@ function pendingSell.inWorld()
     return type(gs) == 'number' and gs == 3
 end
 
+function pendingSell.newId(prefix)
+    pendingSell.sequence = pendingSell.sequence + 1
+    return prefix..':'..tostring(os.time())..':'..tostring(math.floor(os.clock()*1000000))..':'..pendingSell.sequence
+end
+
 function pendingSell.findLot(model, price)
-    model = normalizeName(model or '')
-    price = tonumber(price) or 0
-    local byModel
-    for i = 1, #(pendingSell.lots or {}) do
-        local lot = pendingSell.lots[i]
-        local sameModel = model ~= '' and not isGenericCarName(model)
-            and pendingSell.sameModel(lot.model, model)
-        local samePrice = price > 0 and lot.price == price
-        if sameModel and samePrice then return i, lot end
-        if sameModel and not byModel then byModel = i end
+    model,price = normalizeName(model or ''),tonumber(price) or 0
+    local matches = {}
+    for i,lot in ipairs(pendingSell.lots or {}) do
+        local modelOK = isGenericCarName(model) or isGenericCarName(lot.model) or pendingSell.sameModel(lot.model,model)
+        local priceOK = price <= 0 or tonumber(lot.price) == price
+        if modelOK and priceOK then matches[#matches+1] = i end
     end
-    if byModel then return byModel, pendingSell.lots[byModel] end
-    if price > 0 then
-        for i = 1, #pendingSell.lots do
-            if pendingSell.lots[i].price == price then
-                return i, pendingSell.lots[i]
-            end
+    if #matches == 1 then return matches[1],pendingSell.lots[matches[1]] end
+    -- Identical cars remain distinct lots. A detailed sale of that exact model
+    -- and price may consume one; a generic same-price sale remains ambiguous.
+    if #matches > 1 and price > 0 and not isGenericCarName(model) then
+        for _,i in ipairs(matches) do
+            if not pendingSell.sameModel(pendingSell.lots[i].model,model) then return nil end
         end
+        return matches[1],pendingSell.lots[matches[1]]
     end
-    if #pendingSell.lots == 1 then return 1, pendingSell.lots[1] end
-    return nil
 end
 
 function pendingSell.addLot(model, price, source)
-    price = tonumber(price) or 0
-    if price <= 0 then return false end
+    price = cleanPriceNum(price)
+    if not price then return false end
     model = normalizeName(model or pendingSell.draftModel or '')
     if isGenericCarName(model) then model = '' end
-    pendingSell.lots = pendingSell.lots or {}
-    for i = 1, #pendingSell.lots do
-        local lot = pendingSell.lots[i]
-        local sameCar = lot.price == price and (
-            isGenericCarName(lot.model) or model == '' or pendingSell.sameModel(lot.model, model)
-        )
-        if sameCar then
-            if model ~= '' then lot.model = pendingSell.preferName(lot.model, model) end
-            lot.t = os.clock()
-            lot.at = os.time()
-            lot.source = source or lot.source
-            saveDealLogs()
-            return true
-        end
-    end
-    while #pendingSell.lots >= (pendingSell.max or 2) do
-        table.remove(pendingSell.lots, 1)
-    end
-    pendingSell.lots[#pendingSell.lots + 1] = {
-        model = model,
-        price = price,
-        t = os.clock(),
-        at = os.time(),
-        source = tostring(source or 'chat'),
-    }
+    -- Every server listing confirmation is a new lot, even for equal cars.
+    pendingSell.lots[#pendingSell.lots+1] = {id=pendingSell.newId('lot'), model=model,price=price,
+        t=os.clock(),at=os.time(),source=tostring(source or 'chat')}
     saveDealLogs()
     return true
 end
@@ -2304,35 +2350,31 @@ function pendingSell.removeLot(idx)
     return lot
 end
 
-function pendingSell.isOwn(model, price)
-    price = tonumber(price)
-    model = normalizeName(model or '')
-    for i = 1, #(pendingSell.lots or {}) do
-        local lot = pendingSell.lots[i]
-        if price and lot.price == price then
-            if isGenericCarName(lot.model) or model == '' or pendingSell.sameModel(lot.model, model) then
-                return true, i, lot
-            end
+function pendingSell.localNick()
+    if type(sampGetPlayerIdByCharHandle) ~= 'function' or type(sampGetPlayerNickname) ~= 'function' then return nil end
+    local ok,found,id=pcall(sampGetPlayerIdByCharHandle,PLAYER_PED)
+    if ok and found then
+        local good,nick=pcall(sampGetPlayerNickname,id)
+        if good then return ensure_utf8(tostring(nick)) end
+    end
+end
+
+function pendingSell.isOwn(model, price, owner)
+    local nick=pendingSell.localNick()
+    if not nick or owner ~= nick then return false end
+    for i,lot in ipairs(pendingSell.lots) do
+        if tonumber(lot.price) == tonumber(price) and (isGenericCarName(lot.model) or pendingSell.sameModel(lot.model,model)) then
+            return true,i,lot
         end
     end
     return false
 end
 
-local function snapshotBuyFromPlate()
-    local p = nearestPlate(25) or lastFreshPlate(25)
-    if not p then return end
-    if not pendingBuy.active or (os.clock() - (pendingBuy.t or 0)) > 90 then
-        pendingBuy.active = true
-        pendingBuy.t = os.clock()
-        pendingBuy.source = 'plate'
-    end
-    if isGenericCarName(pendingBuy.model) then
-        pendingBuy.model = p.model
-    end
-    if not pendingBuy.price or pendingBuy.price <= 0 then
-        pendingBuy.price = p.price
-        pendingBuy.source = 'plate'
-    end
+function pendingBuy.reset()
+    pendingBuy.active=false
+    pendingBuy.model,pendingBuy.price,pendingBuy.source='',0,''
+    pendingBuy.basePrice,pendingBuy.fee,pendingBuy.token,pendingBuy.dialogId=nil,nil,nil,nil
+    pendingBuy.t=0
 end
 
 local function snapshotSellFromPlate()
@@ -2340,23 +2382,28 @@ local function snapshotSellFromPlate()
     local now = os.clock()
     local px, py, pz = playerPos()
     local changed = false
+    local owner = pendingSell.localNick()
+    if not owner then return end
     for i = 1, #pendingSell.lots do
         local lot = pendingSell.lots[i]
         if isGenericCarName(lot.model) then
             local want = tonumber(lot.price) or 0
             if want > 0 then
-                local p
+                local p,ambiguous
                 for _, row in pairs(knownPlates) do
-                    if row.price == want and (now - (row.t or 0)) <= 45 then
+                    if row.owner == owner and row.price == want and (now - (row.t or 0)) <= 45 then
                         local okd = true
                         if px and row.x and row.y and row.z then
                             local d = dist3(px, py, pz, row.x, row.y, row.z)
                             okd = d and d <= 12
                         end
-                        if okd and (not p or row.t > p.t) then p = row end
+                        if okd then
+                            if p and not pendingSell.sameModel(p.model,row.model) then ambiguous=true end
+                            if not p or row.t > p.t then p=row end
+                        end
                     end
                 end
-                if p and not isGenericCarName(p.model) then
+                if p and not ambiguous and not isGenericCarName(p.model) then
                     lot.model = p.model
                     lot.source = 'plate'
                     changed = true
@@ -2367,22 +2414,15 @@ local function snapshotSellFromPlate()
     if changed then saveDealLogs() end
 end
 
-local function addDeal(action, model, price, source)
+local function addDeal(action, model, price, source, transactionId)
     model = normalizeName(model or 'Транспорт')
     if model == '' then model = 'Транспорт' end
     price = tonumber(price) or 0
     local nowt = os.time()
-    local last = dealLogs[#dealLogs]
-    if last and last.action == action and last.price == price
-        and (nowt - (last.time or 0)) <= 3
-        and (last.model == model or pendingSell.sameModel(last.model, model)) then
-        if isGenericCarName(last.model) and not isGenericCarName(model) then
-            last.model = model
-            saveDealLogs()
-        end
-        return false
-    end
+    transactionId = transactionId or pendingSell.newId('deal')
+    for _,row in ipairs(dealLogs) do if row.id == transactionId then return false end end
     dealLogs[#dealLogs + 1] = {
+        id = transactionId,
         action = action,
         model = model,
         price = price,
@@ -2407,40 +2447,172 @@ local function addDeal(action, model, price, source)
     return true
 end
 
-local function noteDealDialog(title, text)
+function pendingSell.commit(entry, model, price, source, lotId)
+    if entry.state == 'recorded' then return false end
+    model,price=normalizeName(model or ''),cleanPriceNum(price)
+    if isGenericCarName(model) or not price then return false end
+    local index,lot
+    if entry.action == 'sell' then
+        if lotId then
+            for i,value in ipairs(pendingSell.lots) do if value.id == lotId then index,lot=i,value; break end end
+        else index,lot=pendingSell.findLot(model,price) end
+    end
+    entry.state,entry.model,entry.price='recorded',model,price
+    if scanState.manualConfirmation == entry.id then scanState.manualConfirmation=nil end
+    entry.recordedAt=os.clock()
+    if index then table.remove(pendingSell.lots,index) end
+    addDeal(entry.action,model,price,source,entry.id)
+    saveDealLogs()
+    return true
+end
+
+function pendingSell.resolve(id, candidateId, model, price)
+    for _,entry in ipairs(pendingSell.confirmations) do
+        if entry.id == id and entry.state ~= 'recorded' and entry.state ~= 'dismissed' then
+            if candidateId then
+                for _,candidate in ipairs(entry.candidates or {}) do
+                    if candidate.id == candidateId then
+                        return pendingSell.commit(entry,candidate.model,candidate.price,'confirmed',candidate.id)
+                    end
+                end
+                return false
+            end
+            return pendingSell.commit(entry,model,price,'manual')
+        end
+    end
+    return false
+end
+
+function pendingSell.confirmGeneric(action)
+    -- Some server actions emit detailed and generic confirmations together.
+    for _,detail in ipairs(pendingSell.details) do
+        if detail.action == action and not detail.paired and os.clock()-detail.at < 1
+            and (action ~= 'buy' or not pendingBuy.active or pendingBuy.token == detail.context) then
+            detail.paired=true
+            return
+        end
+    end
+    local entry={id=pendingSell.newId('tx'),action=action,state='waiting',at=os.time(),
+        deadline=os.clock()+2.5,candidates={}}
+    if action == 'buy' then
+        if pendingBuy.active and os.clock()-(pendingBuy.t or 0)<90 then
+            entry.model,entry.price,entry.basePrice,entry.context = pendingBuy.model,pendingBuy.price,pendingBuy.basePrice,pendingBuy.token
+        end
+        pendingBuy.reset()
+    else
+        snapshotSellFromPlate()
+        for _,lot in ipairs(pendingSell.lots) do
+            entry.candidates[#entry.candidates+1]={id=lot.id,model=lot.model,price=lot.price}
+        end
+    end
+    pendingSell.confirmations[#pendingSell.confirmations+1]=entry
+    saveDealLogs()
+end
+
+function pendingSell.recordDetail(action, model, price)
+    model,price=normalizeName(model),cleanPriceNum(price)
+    if not price or isGenericCarName(model) then return end
+    local context=pendingBuy.token
+    if action == 'buy' and pendingBuy.active and pendingSell.sameModel(model,pendingBuy.model)
+        and price == pendingBuy.basePrice then price=pendingBuy.price end
+    local chosen
+    for _,entry in ipairs(pendingSell.confirmations) do
+        if entry.action == action and not entry.hasDetail and entry.state ~= 'dismissed'
+            and (entry.state ~= 'recorded' or os.clock()-(entry.recordedAt or 0)<10) then
+            local matching=action == 'buy' and (not context or context == entry.context)
+                and (isGenericCarName(entry.model) or pendingSell.sameModel(entry.model,model))
+                and (not entry.price or entry.price == 0 or entry.price == price or entry.basePrice == price)
+            if action == 'sell' then
+                matching=#(entry.candidates or {})==0
+                for _,candidate in ipairs(entry.candidates or {}) do
+                    if pendingSell.sameModel(candidate.model,model) and candidate.price == price then matching=true; break end
+                end
+            end
+            if matching then chosen=entry; break end
+        end
+    end
+    if not chosen then chosen={id=pendingSell.newId('tx'),action=action,state='waiting',at=os.time(),candidates={}} end
+    if action == 'buy' and chosen.basePrice == price and chosen.price then price=chosen.price end
+    local paired=chosen.deadline ~= nil
+    chosen.hasDetail=true
+    pendingSell.commit(chosen,model,price,'chat')
+    pendingSell.details[#pendingSell.details+1]={action=action,at=os.clock(),paired=paired,context=context}
+    while #pendingSell.details>20 do table.remove(pendingSell.details,1) end
+    if action == 'buy' then pendingBuy.reset() end
+end
+
+function pendingSell.pumpConfirmations()
+    for _,entry in ipairs(pendingSell.confirmations) do
+        if entry.state == 'waiting' and os.clock()>=(entry.deadline or math.huge) then
+            local done=false
+            if entry.action == 'buy' and entry.model and entry.price then
+                done=pendingSell.commit(entry,entry.model,entry.price,'dialog')
+            elseif entry.action == 'sell' and #entry.candidates==1 then
+                local candidate=entry.candidates[1]
+                for _,lot in ipairs(pendingSell.lots) do
+                    if lot.id == candidate.id and lot.model == candidate.model and lot.price == candidate.price then
+                        done=pendingSell.commit(entry,candidate.model,candidate.price,'listed',candidate.id)
+                        break
+                    end
+                end
+            end
+            if not done then
+                entry.state='unresolved'
+                chat('Подтверждена '..(entry.action=='buy' and 'покупка' or 'продажа')..'. Уточните сделку во вкладке «Сделки».')
+                saveDealLogs()
+            end
+        end
+    end
+    for i=#pendingSell.confirmations,1,-1 do
+        local entry=pendingSell.confirmations[i]
+        if entry.state == 'dismissed' or (entry.state == 'recorded' and os.clock()-(entry.recordedAt or 0)>10) then
+            table.remove(pendingSell.confirmations,i)
+        end
+    end
+end
+
+local function noteDealDialog(title, text, dialogId)
     title = repair_mojibake(stripColors(ensure_utf8(tostring(title or ''))))
     text = repair_mojibake(stripColors(ensure_utf8(tostring(text or ''))))
 
     if title:find('Подтверждение покупки', 1, true) then
+        pendingBuy.reset()
+        pendingBuy.token = pendingSell.newId('quote')
+        pendingBuy.dialogId = dialogId
         local model = text:match('Транспорт:%s*([^\r\n]+)') or text:match('Модель:%s*([^\r\n]+)')
         if model then
-            model = normalizeName((model:gsub('%s*%[%d+%]$', '')))
+            model = normalizeName(model:gsub('%s*%[%d+%]', ''))
+            model = model:gsub('%s+TT$', ''):gsub('%s+ТТ$', '')
         end
         local price
-        local a, b = text:match(':CASH:([%d%.,%s]+).-:CASH:([%d%.,%s]+)')
+        local costLine = text:match('Стоимость автомобиля:%s*([^\r\n]+)')
+            or text:match('Стоимость транспорта:%s*([^\r\n]+)')
+            or text:match('Цена:%s*([^\r\n]+)') or ''
+        local a, b = costLine:match(':CASH:([%d%.,%s]+).-:CASH:([%d%.,%s]+)')
         if a and b then
-            price = (parsePlatePrice(a) or 0) + (parsePlatePrice(b) or 0)
+            pendingBuy.basePrice,pendingBuy.fee=parsePlatePrice(a),parsePlatePrice(b)
+            if pendingBuy.basePrice and pendingBuy.fee then price=pendingBuy.basePrice+pendingBuy.fee end
         else
             local chars = 'kKкКmMмМlLлЛnNнНtTтТyYыЫsSсСbBбБrRрРdDдД'
-            local p1, p2 = text:match('[%$]?%s*([%d%.%,%s' .. chars .. ']+)%s*%+.-[%$]?%s*([%d%.%,%s' .. chars .. ']+)')
+            local p1, p2 = costLine:match('[%$]?%s*([%d%.%,%s' .. chars .. ']+)%s*%+.-[%$]?%s*([%d%.%,%s' .. chars .. ']+)')
             if p1 and p2 then
                 price = (parseAbbrevPrice(p1) or 0) + (parseAbbrevPrice(p2) or 0)
             else
-                price = parsePlatePrice(text)
+                price = parsePlatePrice(costLine)
             end
         end
         pendingBuy.active = true
-        pendingBuy.model = (model ~= '' and model) or pendingBuy.model or 'Транспорт'
-        pendingBuy.price = (price and price > 0) and price or (pendingBuy.price or 0)
+        pendingBuy.model = model or ''
+        pendingBuy.price = (price and price > 0) and price or 0
         pendingBuy.t = os.clock()
         pendingBuy.source = (price and price > 0) and 'dialog' or pendingBuy.source
-        needBuySnapshot = true
     end
 
     if title:find('Продажа', 1, true) or title:find('Аукцион', 1, true) or title:find('продажу', 1, true) then
         local model = text:match('Транспорт:%s*([^\r\n]+)') or text:match('Модель:%s*([^\r\n]+)')
         if model then
             pendingSell.draftModel = normalizeName((model:gsub('%s*%[%d+%]$', '')))
+            pendingSell.draftAt,pendingSell.draftDialogId=os.clock(),dialogId
         end
     end
 end
@@ -2456,24 +2628,13 @@ local function processDealChat(raw)
     if bought_model and bought_price then
         local price = parseAbbrevPrice(bought_price)
         if price then
-            addDeal('buy', bought_model, price, 'chat')
-            pendingBuy.active = false
+            pendingSell.recordDetail('buy',bought_model,price)
             return
         end
     end
 
-    if clean:find('Поздравляем с приобретением транспортного средства', 1, true) then
-        if pendingBuy.active and (os.clock() - (pendingBuy.t or 0)) < 90 and pendingBuy.price and pendingBuy.price > 0 then
-            addDeal('buy', pendingBuy.model, pendingBuy.price, pendingBuy.source)
-        else
-            snapshotBuyFromPlate()
-            if pendingBuy.price and pendingBuy.price > 0 then
-                addDeal('buy', pendingBuy.model, pendingBuy.price, 'plate')
-            else
-                addDeal('buy', pendingBuy.model ~= '' and pendingBuy.model or 'Транспорт', 0, 'unknown')
-            end
-        end
-        pendingBuy.active = false
+    if clean:find('Поздравляем с приобретением транспортного средства',1,true) then
+        pendingSell.confirmGeneric('buy')
         return
     end
 
@@ -2491,7 +2652,7 @@ local function processDealChat(raw)
         local price = parseAbbrevPrice(listed_price)
         local model = listed_model
         if not model or isGenericCarName(model) then
-            model = pendingSell.draftModel
+            model = os.clock()-(pendingSell.draftAt or -100)<30 and pendingSell.draftModel or ''
             needSellSnapshot = true
         end
         if price and price > 0 then
@@ -2500,18 +2661,8 @@ local function processDealChat(raw)
         end
     end
 
-    if clean:find('Поздравляем с продажей транспортного средства', 1, true) then
-        snapshotSellFromPlate()
-        if #pendingSell.lots == 1 then
-            local lot = pendingSell.lots[1]
-            if lot.price and lot.price > 0 and (os.time() - (lot.at or 0)) < 43200 then
-                addDeal('sell', lot.model, lot.price, lot.source)
-            end
-            pendingSell.removeLot(1)
-        elseif #pendingSell.lots >= 2 then
-            pendingSell.awaitSell = os.clock()
-        end
-        needSellSnapshot = false
+    if clean:find('Поздравляем с продажей транспортного средства',1,true) then
+        pendingSell.confirmGeneric('sell')
         return
     end
 
@@ -2525,7 +2676,7 @@ local function processDealChat(raw)
     local auc_model, auc_price = clean:match('Вы успешно выкупили транспорт (.-) с аукциона за %D*(.+)')
     if auc_model and auc_price then
         local price = parseAbbrevPrice(auc_price)
-        if price then addDeal('buy', auc_model, price, 'chat') end
+        if price then pendingSell.recordDetail('buy',auc_model,price) end
         return
     end
 
@@ -2536,27 +2687,17 @@ local function processDealChat(raw)
     end
     if sold_model and sold_price then
         local price = parseAbbrevPrice(sold_price)
-        pendingSell.awaitSell = 0
-        local idx, lot = pendingSell.findLot(sold_model, price)
-        local model = sold_model
-        if lot then
-            model = pendingSell.preferName(lot.model, sold_model)
-        else
-            local _, avgName = resolveAvgForModel(sold_model)
-            if avgName and avgName ~= '' then
-                model = pendingSell.preferName(avgName, sold_model)
-            end
-        end
-        if price then addDeal('sell', model, price, 'chat') end
-        if idx then pendingSell.removeLot(idx) end
+            if price then pendingSell.recordDetail('sell',sold_model,price) end
     end
 end
 
 local function queuePlate(item)
     if not saleAlive or type(item) ~= 'table' then return end
     if type(item.text) ~= 'string' or item.text == '' then return end
+    local object=item.sampId and scanState.mark.objects[item.sampId]
+    if object then item.generation=object.generation end
     incomingPlates[#incomingPlates + 1] = item
-    if #incomingPlates > 80 then table.remove(incomingPlates, 1) end
+    if #incomingPlates > 512 then table.remove(incomingPlates, 1) end
 end
 
 -- RPC только копирует строку/числа. Чат — в pump, не из пакета.
@@ -2566,7 +2707,7 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     local kind, model, price, turbo = parseSalePlate(text)
     if not kind then
         local tt = scanState.mark.turboOf(text) == 'Twin Turbo'
-        if fromSign or tt or scanState.mark.inAb() then
+        if fromSign or (scanState.mark.inAb() and scanState.mark.looksLikePlate(text)) then
             kind, model, price, turbo = scanState.mark.parseShort(text)
         elseif sampId and not scanState.mark.objectHandle(sampId) and scanState.mark.looksLikePlate(text) then
             scanState.mark.holdShort(sampId, key, text, x, y, z)
@@ -2579,9 +2720,12 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     if not (x and y and z) and sampId then
         x, y, z = tryObjectPos(sampId)
     end
-    rememberPlate(key, model, price, x, y, z)
+    local owner=scanState.mark.clean(text):match('Владелец:%s*([^\n]+)')
+    if owner then owner=normalizeName(owner) end
+    rememberPlate(key, model, price, x, y, z, owner)
+    if knownPlates[key] then knownPlates[key].objectId=sampId end
 
-    local own, ownIdx, ownLot = pendingSell.isOwn(model, price)
+    local own, ownIdx, ownLot = pendingSell.isOwn(model, price, owner)
     if own and ownLot and isGenericCarName(ownLot.model) then
         local dist
         if x and y and z then
@@ -2662,21 +2806,6 @@ local function pumpSales()
         end
     end)
 
-    if pendingSell.awaitSell and pendingSell.awaitSell > 0
-        and (os.clock() - pendingSell.awaitSell) > 2.5 then
-        local lot = pendingSell.lots[1]
-        if lot and tonumber(lot.price) and lot.price > 0 then
-            addDeal('sell', lot.model, lot.price, lot.source)
-        end
-        pendingSell.removeLot(1)
-        pendingSell.awaitSell = 0
-    end
-
-    if needBuySnapshot then
-        pcall(snapshotBuyFromPlate)
-        needBuySnapshot = false
-    end
-
     local nc = #incomingChat
     if nc > 0 then
         local chats = incomingChat
@@ -2686,13 +2815,18 @@ local function pumpSales()
         end
     end
 
+    pendingSell.pumpConfirmations()
+
     local n = #incomingPlates
     if n > 0 then
         local batch = incomingPlates
         incomingPlates = {}
         for i = 1, n do
             local it = batch[i]
-            pcall(onNewSalePlate, it.key, it.text, it.minPrice, it.x, it.y, it.z, it.sampId)
+            local object=it.sampId and scanState.mark.objects[it.sampId]
+            if not it.generation or (object and object.generation == it.generation) then
+                pcall(onNewSalePlate, it.key, it.text, it.minPrice, it.x, it.y, it.z, it.sampId)
+            end
         end
     end
 
@@ -2736,8 +2870,11 @@ end
 local passportJob = { at = 0, model = '', tries = 0, sid = 0 }
 
 local function pickCarName(s)
+    if type(s) ~= 'string' then return nil end
     s = normalizeName(s)
     if s == '' or #s < 2 or #s > 48 then return nil end
+    if not scanState.mark.validModel(s) then return nil end
+    if s:find('паспорт', 1, true) or s:find('Паспорт', 1, true) then return nil end
     if s:find('https://', 1, true) or s:find('http://', 1, true) then return nil end
     if s:match('^%w+_%w+$') then return nil end
     if s:match('^%d%d[%.%/%-]') then return nil end
@@ -2786,7 +2923,7 @@ local function looksLikeVehicleDoc(doc, event, text)
     if text:find('Технический паспорт', 1, true) or text:find('технический паспорт', 1, true) then
         return true
     end
-    if event:find('documents', 1, true) then
+    if event:find('document', 1, true) then
         local t = type(doc) == 'table' and tonumber(doc.type)
         if t == 1 or t == 2 or t == 4 then return false end
         if t == 6 then return true end
@@ -2804,6 +2941,7 @@ end
 local function parsePassportModel(text)
     text = stripColors(ensure_utf8(tostring(text or '')))
     local m = text:match('Транспорт:%s*([^\r\n]+)')
+        or text:match('Лимитированный авто:%s*([^\r\n]+)')
         or text:match('Модель:%s*([^\r\n]+)')
         or text:match('Название:%s*([^\r\n]+)')
     if not m then return nil end
@@ -2845,11 +2983,13 @@ local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     local utf = ensure_utf8(text)
     if utf:find('Средняя цена:', 1, true) or utf:find('Дешевле средней', 1, true) then return end
     local model = parsePassportModel(text)
+    local owner = stripColors(utf):match('Владелец:%s*([^\r\n]+)')
+    if owner then owner=normalizeName(owner) end
     local avg, avgName = nil, nil
     if model then avg, avgName = resolveAvgForModel(model) end
     -- приоритет: табличка рядом → текст ПТС (цена продажи)
-    local lot = model and select(1, scanState.findLot(model)) or nil
-    if (not lot or lot < 1000000) then
+    local lot = model and select(1, scanState.findLot(model, owner)) or nil
+    if (not lot or lot <= 0) then
         lot = passportLotFromText(utf)
     end
     local avgLabel = avg and fmtMoney(avg) or 'нет в базе'
@@ -2857,17 +2997,20 @@ local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
         avgLabel = ('%s (%s)'):format(avgLabel, avgName)
     end
     local parts = { ('Средняя цена: %s'):format(avgLabel) }
-    if lot and lot >= 1000000 then
+    if lot and lot > 0 then
         parts[#parts + 1] = ('Лот: %s'):format(fmtMoney(lot))
         local vs = vsAvgInfo(lot, avg)
         if vs.title == 'Дешевле средней' then
             parts[#parts + 1] = ('{%s}%s %s'):format(vs.samp, vs.title, vs.detail)
         elseif vs.title == 'Дороже средней' then
             parts[#parts + 1] = ('{%s}%s %s'):format(vs.samp, vs.title, vs.detail)
-        end
+        elseif vs.title then parts[#parts+1] = vs.title end
+    else
+        parts[#parts+1] = 'Цена лота: не определена'
     end
     local line = d('\n\n' .. table.concat(parts, '\n'))
     passportJob.patch = {
+        finger = scanState.currentDialog and scanState.currentDialog.finger,
         id = tonumber(id) or DIALOG_PASSPORT_ID,
         style = tonumber(style) or 0,
         title = title or '',
@@ -2878,16 +3021,17 @@ local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     }
 end
 
-local function queuePassportOverlay(model, sid, lot)
+local function queuePassportOverlay(model, sid, lot, owner)
     model = pickCarName(model) or normalizeName(model)
     if not showPassportAvg[0] or model == '' then return end
     passportJob.model = model
     passportJob.sid = tonumber(sid) or 0
+    passportJob.lotOwner = owner
     lot = tonumber(lot) or 0
-    if lot < 1000000 then
-        lot = select(1, scanState.findLot(model)) or 0
+    if lot <= 0 then
+        lot = select(1, scanState.findLot(model, owner)) or 0
     end
-    passportJob.lotPrice = (lot >= 1000000) and lot or 0
+    passportJob.lotPrice = (lot > 0) and lot or 0
     passportJob.lotModel = model
     passportJob.at = os.clock() + 0.28
     passportJob.tries = 0
@@ -2897,24 +3041,24 @@ local function injectPassportPrice(model)
     if not (ok_arz and arz and arz.eval) then return end
     local avg, avgName = resolveAvgForModel(model)
     -- только табличка этой модели рядом; stale lotPrice — лишь если модель та же
-    local lot = select(1, scanState.findLot(model)) or 0
-    if lot < 1000000
+    local lot = select(1, scanState.findLot(model, passportJob.lotOwner)) or 0
+    if lot <= 0
         and passportJob.lotModel
         and foldName(passportJob.lotModel) == foldName(model)
     then
         lot = tonumber(passportJob.lotPrice) or 0
     end
-    if lot < 1000000 then lot = 0 end
+    if lot <= 0 then lot = 0 end
     local avgLine = avg and ('Средняя: %s'):format(fmtMoney(avg)) or 'Средняя: нет в базе'
     if avg and avgName and model and foldName(avgName) ~= foldName(model) then
         avgLine = ('Средняя: %s (%s)'):format(fmtMoney(avg), avgName)
     end
     local lines = { avgLine }
     local color = '#f3f3f3'
-    if lot >= 1000000 then
+    if lot > 0 then
         lines[#lines + 1] = ('Лот: %s'):format(fmtMoney(lot))
         local vs = vsAvgInfo(lot, avg)
-        if vs.title == 'Дешевле средней' or vs.title == 'Дороже средней' then
+        if vs.title then
             color = vs.color
             lines[#lines + 1] = (vs.title .. ' ' .. vs.detail):gsub('%s+$', '')
         end
@@ -2929,27 +3073,16 @@ var el=document.createElement('div');
 el.id=id;
 el.textContent=]] .. q .. [[;
 el.style.cssText='width:100%;margin-top:6px;padding:10px 14px 16px;text-align:center;font-size:15px;font-weight:600;color:]] .. color .. [[;letter-spacing:.02em;box-sizing:border-box;white-space:pre-line;';
-var needles=['Технический паспорт','Информация о транспорте','информацию о транспорте','Пробег','Владелец','Госномер','Гос. номер'];
-var host=null;
-var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
-var n;
-while(n=w.nextNode()){
-  var v=n.nodeValue||'';
-  for(var i=0;i<needles.length;i++){
-    if(v.indexOf(needles[i])!==-1){ host=n.parentElement; break; }
-  }
-  if(host) break;
-}
-var box=host;
-for(var i=0;i<12&&box&&box.parentElement;i++){
-  if(box.scrollHeight>220) break;
-  box=box.parentElement;
-}
-if(!box){
-  box=document.querySelector('.dialog')
-    ||document.querySelector('[class*="modal"]')
-    ||document.querySelector('[class*="document"]')
-    ||document.querySelector('[class*="passport"]');
+var nodes=document.querySelectorAll('.dialog, [class*="document"], [class*="passport"]');
+var box=null;
+for(var i=0;i<nodes.length;i++){
+  var candidate=nodes[i];
+  if(!candidate.getClientRects().length) continue;
+  var text=String(candidate.innerText||candidate.textContent||'');
+  var passport=text.indexOf('Технический паспорт')!==-1 || text.indexOf('Информация о транспорте')!==-1;
+  if(!passport) continue;
+  if(text.indexOf('Средняя цена:')!==-1) return;
+  box=candidate; break;
 }
 if(!box) return;
 box.appendChild(el);
@@ -2961,6 +3094,8 @@ local function pumpPassportOverlay()
     local patch = passportJob.patch
     if patch and os.clock() >= (patch.at or 0) then
         passportJob.patch = nil
+        if patch.finger and (not scanState.currentDialog or scanState.currentDialog.finger ~= patch.finger) then return end
+        if type(sampIsDialogActive) == 'function' and not sampIsDialogActive() then return end
         pcall(function()
             if ok_cef and cefDlg and cefDlg.Show then
                 cefDlg.Show(patch.id, patch.title, patch.text, patch.btn1, patch.btn2, patch.style)
@@ -2995,12 +3130,14 @@ local function noteVehiclePassport(packet)
     if type(doc) == 'table' and doc[1] then doc = doc[1] end
     if not looksLikeVehicleDoc(doc, event, text) then return end
     local model = carNameFromNode(doc)
+    local owner = type(doc)=='table' and (doc.ownerName or doc.owner) or nil
+    if type(owner)~='string' then owner=nil else owner=normalizeName(owner) end
     if not model then
         model = parsePassportModel(text)
     end
     -- 1) табличка рядом  2) CEF sellPrice  3) текст
-    local lot = model and select(1, scanState.findLot(model)) or nil
-    if (not lot or lot < 1000000) and type(doc) == 'table' then
+    local lot = model and select(1, scanState.findLot(model, owner)) or nil
+    if (not lot or lot <= 0) and type(doc) == 'table' then
         local raw = doc.sellPrice or doc.sell_price or doc.listingPrice or doc.lotPrice
             or doc.price or doc.cost
         if type(raw) == 'table' then raw = raw.value or raw.price or raw[1] end
@@ -3008,18 +3145,13 @@ local function noteVehiclePassport(packet)
         if type(raw) == 'string' then p = parsePlatePrice(raw)
         elseif type(raw) == 'number' then
             p = math.floor(raw)
-            -- иногда приходит в тысячах / сокращённо
-            if p > 0 and p < 1000000 then
-                local scaled = p * 1000
-                if scaled >= 1000000 and scaled < 2147483647 then p = scaled end
-            end
         end
-        if p and p >= 1000000 then lot = p end
+        if p and p > 0 then lot = p end
     end
-    if (not lot or lot < 1000000) then
+    if (not lot or lot <= 0) then
         lot = passportLotFromText(text)
     end
-    if model then queuePassportOverlay(model, sid, (lot and lot >= 1000000) and lot or 0) end
+    if model then queuePassportOverlay(model, sid, (lot and lot > 0) and lot or 0, owner) end
 end
 
 local function ingestAbCefPacket(packet)
@@ -3030,8 +3162,7 @@ local function ingestAbCefPacket(packet)
     if evName:find('inventory', 1, true) or evName:find('storage', 1, true) then return end
     if rawText:find('playerInventory', 1, true) or rawText:find('event.storage', 1, true) then return end
     local jsonLead = jsonText0:gsub('^%s+', ''):sub(1, 1)
-    if jsonLead == '[' then return end
-    if jsonLead == '{' and type(packet.json) ~= 'table' then
+    if (jsonLead == '{' or jsonLead == '[') and type(packet.json) ~= 'table' then
         local ok, copy = safeDecodeJson(jsonText0)
         if ok then packet.json = copy end
     end
@@ -3049,47 +3180,53 @@ local function ingestAbCefPacket(packet)
 end
 
 local function queueCefSnap(packet)
-    if not packet then return end
-    local snap = { text = '', event = '', server_id = 0, jsonText = '' }
-    pcall(function()
-        local t = packet.text
-        if type(t) == 'string' and t ~= '' and #t < 8000 then snap.text = t .. '' end
-        local e = packet.event
-        if type(e) == 'string' then snap.event = e .. '' end
-        snap.server_id = tonumber(packet.server_id) or 0
-        local j = packet.json
-        if type(j) == 'string' and #j < 8000 and j:gsub('^%s+', ''):sub(1, 1) == '{' then
-            snap.jsonText = j .. ''
-        end
-    end)
-    if snap.event == '' and snap.text ~= '' then
-        local ev = snap.text:match("executeEvent%('([^']+)'")
-        if ev then snap.event = ev .. '' end
-        if snap.jsonText == '' then
-            local js = snap.text:match("executeEvent%('[^']+',%s*`([^`]*)`%)")
-            if js and #js < 8000 and js:gsub('^%s+', ''):sub(1, 1) == '{' then
-                snap.jsonText = js
-            end
-        end
+    if type(packet) ~= 'table' then return end
+    local text = type(packet.text) == 'string' and packet.text or ''
+    if #text > 131072 then return end
+    local snap = {text=text, event=tostring(packet.event or ''), server_id=tonumber(packet.server_id) or 0, jsonText=''}
+    local payloads = extractJsonPayloads(text)
+    if payloads[1] then
+        snap.event = snap.event ~= '' and snap.event or payloads[1].event
+        snap.jsonText = payloads[1].json
+    elseif type(packet.json) == 'string' then
+        snap.jsonText = packet.json
+    elseif type(packet.json) == 'table' then
+        snap.json = packet.json
     end
-    local evl, txt = snap.event, snap.text
-    if evl:find('inventory', 1, true) or evl:find('storage', 1, true) then return end
-    if txt:find('playerInventory', 1, true) or txt:find('event.storage', 1, true) then return end
-    local keep = isAbCefText(txt, evl)
-        or evl:find('dialog', 1, true)
-        or evl:find('document', 1, true)
-        or evl:find('passport', 1, true)
-        or txt:find('Технический паспорт', 1, true)
-        or txt:find('технический паспорт', 1, true)
-        or txt:find('Средняя цена', 1, true)
-    if not keep then return end
-    if snap.text == '' and snap.jsonText == '' then return end
-    incomingCef[#incomingCef + 1] = snap
-    if #incomingCef > 24 then table.remove(incomingCef, 1) end
+    local utf = ensure_utf8(text)
+    if snap.event:find('inventory',1,true) or snap.event:find('storage',1,true) then return end
+    if utf:find('playerInventory',1,true) or utf:find('event.storage',1,true) then return end
+    if not (isAbCefText(utf,snap.event) or snap.event:find('dialog',1,true)
+        or snap.event:find('document',1,true) or snap.event:find('passport',1,true)
+        or utf:find('Технический паспорт',1,true)) then return end
+    incomingCef[#incomingCef+1] = snap
+    if #incomingCef > 256 then table.remove(incomingCef,1) end
 end
 
-chainArz('onArizonaDisplay', queueCefSnap)
-chainArz('onArizonaIncomingCef18', queueCefSnap)
+-- Read directly: library callbacks may be absent or reject compressed data.
+function scanState.readCefPacket(bs)
+    local offset = raknetBitStreamGetReadOffset(bs)
+    local ok, text, server = pcall(function()
+        raknetBitStreamSetReadOffset(bs,0)
+        raknetBitStreamIgnoreBits(bs,8)
+        if raknetBitStreamReadInt8(bs) ~= 17 then return end
+        local sid = raknetBitStreamReadInt32(bs)
+        local length = raknetBitStreamReadInt16(bs)
+        if length < 0 then length = length + 65536 end
+        local encoded = raknetBitStreamReadInt8(bs)
+        if length == 0 then return '',sid end
+        if encoded ~= 0 then return raknetBitStreamDecodeString(bs,length+1),sid end
+        if length*8 > raknetBitStreamGetNumberOfUnreadBits(bs) then error('truncated CEF text') end
+        return raknetBitStreamReadString(bs,length),sid
+    end)
+    raknetBitStreamSetReadOffset(bs,offset)
+    if ok then return text,server end
+end
+addEventHandler('onReceivePacket',function(id,bs)
+    if id ~= 220 then return end
+    local text,server = scanState.readCefPacket(bs)
+    if type(text) == 'string' and text ~= '' then queueCefSnap({text=text,server_id=server}) end
+end)
 
 -- Только окна АБ. Угон и похожие списки dlg не перезаписывают.
 local lastDlgFinger = ''
@@ -3098,20 +3235,28 @@ local function onAnyDialog(id, style, title, btn1, btn2, text)
     if kind == 'list' then
         scanState.listUntil = os.clock() + 4
     end
-    local finger = tostring(tonumber(id) or 0) .. '\1' .. tostring(title or '') .. '\1' .. tostring(#(text or ''))
-    if finger == lastDlgFinger and not scanState.forceDlg then return end
+    local finger = table.concat({tostring(id),tostring(style),tostring(title),tostring(text)}, '\1')
+    if finger == lastDlgFinger then return end
     lastDlgFinger = finger
+    scanState.currentDialog = {id=tonumber(id), kind=kind, finger=finger}
+    if kind == 'other' then
+        scanState.dlg = nil
+        if scanState.active then
+            scanState.active, scanState.stopped = false, true
+        end
+    end
     local titleU = stripColors(ensure_utf8(tostring(title or '')))
     if isPassportDialog(id, titleU) then
         queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     end
     if title or text then
-        pcall(noteDealDialog, title, text)
+        pcall(noteDealDialog, title, text, id)
     end
     if not text then return end
     if kind ~= 'list' and kind ~= 'days' then return end
     ingestDialog(id, style, title, btn1, btn2, text)
 end
+scanState.consumeDialog = onAnyDialog
 
 local function pumpCefDialog()
     if #incomingCef > 0 then
@@ -3139,6 +3284,14 @@ local function pumpCefDialog()
 end
 
 if ok_ev and ev then
+    local prevResponse = ev.onSendDialogResponse
+    function ev.onSendDialogResponse(id, button, listitem, input)
+        if tonumber(button) == 0 then
+            if pendingBuy.dialogId == id then pendingBuy.reset() end
+            if pendingSell.draftDialogId == id then pendingSell.draftModel=''; pendingSell.draftAt=nil end
+        end
+        if prevResponse then return prevResponse(id,button,listitem,input) end
+    end
     local prevDlg = ev.onShowDialog
     function ev.onShowDialog(id, style, title, btn1, btn2, text)
         pcall(function()
@@ -3156,6 +3309,41 @@ if ok_ev and ev then
             local ok, a = pcall(prevDlg, id, style, title, btn1, btn2, text)
             if ok then return a end
         end
+    end
+
+    local prevCreate = ev.onCreateObject
+    function ev.onCreateObject(id, data)
+        if type(data)=='table' then
+            local pos=data.position or {}
+            scanState.mark.objectSequence=(scanState.mark.objectSequence or 0)+1
+            scanState.mark.objects[id]={generation=scanState.mark.objectSequence,model=tonumber(data.modelId),x=tonumber(pos.x),y=tonumber(pos.y),z=tonumber(pos.z)}
+            PLATES['obj_'..tostring(id)]=nil
+            knownPlates['obj_'..tostring(id)]=nil
+            for _, material in ipairs(data.materialText or data.materials_text or {}) do
+                if type(material.text)=='string' and (tonumber(data.modelId)==scanState.mark.abModel or scanState.mark.looksLikePlate(material.text)) then
+                    queuePlate({key='obj_'..tostring(id),text=material.text,sampId=id,x=tonumber(pos.x),y=tonumber(pos.y),z=tonumber(pos.z)})
+                end
+            end
+        end
+        if prevCreate then return prevCreate(id,data) end
+    end
+    local prevDestroy = ev.onDestroyObject
+    function ev.onDestroyObject(id)
+        scanState.mark.objects[id]=nil
+        scanState.mark.pendingShort[id]=nil
+        PLATES['obj_'..tostring(id)]=nil
+        knownPlates['obj_'..tostring(id)]=nil
+        if prevDestroy then return prevDestroy(id) end
+    end
+    local prevMove = ev.onSetObjectPosition
+    function ev.onSetObjectPosition(id,pos)
+        local object=scanState.mark.objects[id]
+        if object and pos then
+            object.x,object.y,object.z=tonumber(pos.x),tonumber(pos.y),tonumber(pos.z)
+            local plate=knownPlates['obj_'..tostring(id)]
+            if plate then plate.x,plate.y,plate.z=object.x,object.y,object.z end
+        end
+        if prevMove then return prevMove(id,pos) end
     end
 
     local prevMat = ev.onSetObjectMaterialText
@@ -3197,12 +3385,18 @@ if ok_ev and ev then
 
     local prevLost = ev.onConnectionLost
     function ev.onConnectionLost()
+        pendingBuy.reset()
+        scanState.mark.objects = {}
+        knownPlates, PLATES, incomingPlates = {}, {}, {}
         -- сразу в deals.json, до возможной выгрузки скрипта при реконнекте
         pcall(forgetListed)
         if prevLost then pcall(prevLost) end
     end
     local prevClosed = ev.onConnectionClosed
     function ev.onConnectionClosed()
+        pendingBuy.reset()
+        scanState.mark.objects = {}
+        knownPlates, PLATES, incomingPlates = {}, {}, {}
         pcall(forgetListed)
         if prevClosed then pcall(prevClosed) end
     end
@@ -3234,6 +3428,7 @@ local chatState = {
     inFlight = false,     -- один запрос за раз
     lastErrAt = 0,
     wantMouse = false,
+    generation = 0, requestSeq = 0, pollerToken = 0, sendSeq = 0, outgoing = {},
 }
 
 local ok_effil, effil = pcall(require, 'effil')
@@ -3287,6 +3482,15 @@ local function myNickname()
     return 'Я'
 end
 
+function chatState.truncate(text, limit)
+    text = ensure_utf8(tostring(text or ''))
+    text = text:gsub('[%z\1-\8\11\12\14-\31]', ' ')
+    if #text <= limit then return text end
+    text = text:sub(1,limit)
+    while #text > 0 and not is_valid_utf8(text) do text = text:sub(1,-2) end
+    return text
+end
+
 local function pushScriptChat(nick, text, isSelf, shareUrl)
     nick = tostring(nick or '?')
     text = tostring(text or '')
@@ -3301,8 +3505,12 @@ local function pushScriptChat(nick, text, isSelf, shareUrl)
         self = isSelf and true or false,
         shareUrl = shareUrl or '',
     }
-    while #chatLines > 120 do table.remove(chatLines, 1) end
+    while #chatLines > 120 do
+        local old = table.remove(chatLines, 1)
+        if old.messageId then chatState.outgoing[old.messageId]=nil end
+    end
     chatScrollDown = true
+    return chatLines[#chatLines]
 end
 
 -- Асинхронно через effil. Нельзя wait() внутри pcall/OnFrame — MoonLoader убивает скрипт
@@ -3424,7 +3632,7 @@ scanState.pumpHttpJobs = function()
     for i = 1, #jobs do
         local job = jobs[i]
         local done, okFlag, payload, code
-        pcall(function()
+        local checked, checkError = pcall(function()
             local th = job.th
             if not th then
                 done, okFlag, payload, code = true, false, 'нет потока', 0
@@ -3449,6 +3657,12 @@ scanState.pumpHttpJobs = function()
                 okFlag, payload, code = r, th:get(0), th:get(0)
             end
         end)
+        if not checked then
+            done,okFlag,payload,code=true,false,tostring(checkError),0
+        elseif not done and now > (job.untilAt or 0) then
+            pcall(function() job.th:cancel() end)
+            done,okFlag,payload,code=true,false,'timeout',0
+        end
         if done then
             code = tonumber(code) or 0
             if okFlag == true or okFlag == 1 then
@@ -3937,7 +4151,8 @@ function carImg.pump()
     end
 end
 
-function carImg.drawPreview(name, maxW)
+function carImg.drawPreview(name, maxW, scale)
+    scale = scale or 1
     name = normalizeName(name)
     if name == '' then return end
     if carImg.activeName ~= name then
@@ -3964,7 +4179,7 @@ function carImg.drawPreview(name, maxW)
         else
             msg = 'превью…'
         end
-        imgui.SetCursorPos(imgui.ImVec2(12, h / 2 - 8))
+        imgui.SetCursorPos(imgui.ImVec2(12 * scale, h / 2 - 8 * scale))
         imgui.TextDisabled(msg)
         imgui.EndChild()
     end
@@ -4011,13 +4226,13 @@ scanState.writeUpdateFile = function(latest, body)
     if type(body) ~= 'string' or #body < 4000
         or not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
         scanState.updateBusy = false
-        chat('Обновление прошло неудачно. Запускаю текущую версию.')
+        chat('Обновление прошло неудачно. Запускаю текущую версию.', 'error')
         return
     end
     local path = thisScript().path
     if type(path) ~= 'string' or path == '' then
         scanState.updateBusy = false
-        chat('Нет пути скрипта')
+        chat('Нет пути скрипта', 'error')
         return
     end
     pcall(function()
@@ -4032,7 +4247,7 @@ scanState.writeUpdateFile = function(latest, body)
     local f = io.open(path, 'wb')
     if not f then
         scanState.updateBusy = false
-        chat('Не записалось обновление')
+        chat('Не записалось обновление', 'error')
         return
     end
     f:write(body)
@@ -4041,7 +4256,18 @@ scanState.writeUpdateFile = function(latest, body)
     scanState.updateBusy = false
     chat(('Файл обновлён до %s. Меню закрыто.'):format(latest))
     chat('Перезагрузи скрипт: /reload  или перезайди в игру.')
-    chat('Не жми обновление повторно, пока не сделаешь /reload.')
+    chat('Не жми обновление повторно, пока не сделаешь /reload.', 'warning')
+end
+
+function scanState.newerVersion(latest,current)
+    local a,b={},{}
+    for n in tostring(latest):gmatch('%d+') do a[#a+1]=tonumber(n) end
+    for n in tostring(current):gmatch('%d+') do b[#b+1]=tonumber(n) end
+    if #a==0 or #b==0 then return false end
+    for i=1,math.max(#a,#b) do
+        if (a[i] or 0) ~= (b[i] or 0) then return (a[i] or 0) > (b[i] or 0) end
+    end
+    return false
 end
 
 scanState.checkUpdate = function(manual)
@@ -4050,7 +4276,7 @@ scanState.checkUpdate = function(manual)
         return
     end
     if not ok_effil then
-        if manual then chat('Нет сети (effil)') end
+        if manual then chat('Нет сети (effil)', 'error') end
         return
     end
     scanState.updateBusy = true
@@ -4061,7 +4287,7 @@ scanState.checkUpdate = function(manual)
     }, 12, 8, function(raw)
         if type(raw) ~= 'string' then
             scanState.updateBusy = false
-            if manual then chat('GitHub недоступен') end
+            if manual then chat('GitHub недоступен', 'error') end
             return
         end
         local okj, meta = safeDecodeJson(raw)
@@ -4069,11 +4295,11 @@ scanState.checkUpdate = function(manual)
         local updateurl = okj and type(meta) == 'table' and tostring(meta.updateurl or '')
         if not latest or latest == '' then
             scanState.updateBusy = false
-            if manual then chat('Не прочитался version.json') end
+            if manual then chat('Не прочитался version.json', 'error') end
             return
         end
         local cur = tostring(thisScript().version or '0')
-        if latest == cur then
+        if not scanState.newerVersion(latest,cur) then
             scanState.updateBusy = false
             if manual then chat(('Уже актуальная версия %s'):format(cur)) end
             return
@@ -4182,15 +4408,22 @@ end
 local function refreshChatRoom()
     local num, label, topic = resolveArizonaServer()
     local old = chatState.topic
+    local oldKey = chatState.serverKey
     local ip, port = '', 0
     pcall(function()
         ip, port = sampGetCurrentServerAddress()
     end)
+    if tostring(ip or '') == '' or ip == '0.0.0.0' or (tonumber(port) or 0) == 0 then return nil end
     chatState.serverKey = tostring(ip or '') .. ':' .. tostring(tonumber(port) or 0)
     chatState.serverNum = num
     chatState.serverName = label
     chatState.topic = topic
-    if old ~= '' and topic ~= '' and topic ~= old then
+    if old ~= '' and topic ~= '' and (topic ~= old or oldKey ~= chatState.serverKey) then
+        chatState.generation = chatState.generation + 1
+        chatState.inFlight = false
+        chatState.inFlightToken = nil
+        chatLines = {}
+        chatState.outgoing = {}
         chatState.sinceId = nil
         chatState.seen = {}
         chatState.seenOrder = {}
@@ -4242,19 +4475,30 @@ local function ingestNtfyLine(line)
         local a, b, c = msg:match('^([^|]+)|([^|]+)|(.+)$')
         if c then cid, nick, text = a, b, c end
     end
-    if cid ~= '' and cid == chatState.cid then return end
+    if cid ~= '' and cid == chatState.cid then
+        local okOwn, own = safeDecodeJson(msg)
+        local row = okOwn and chatState.outgoing[tostring(own.messageId or '')]
+        if row then row.delivery = 'sent'; row.error = nil end
+        return
+    end
+    local okPayload, payload = safeDecodeJson(msg)
+    if okPayload and payload.messageId and cid ~= '' then
+        if rememberChatId('sender:'..cid..':'..tostring(payload.messageId)) then return end
+    end
+    nick = chatState.truncate(nick,64)
+    if nick == 'Система' then nick = 'Система (участник)' end
+    text = chatState.truncate(text,1000)
     local shareUrl = ''
     local att = obj.attachment
     if type(att) == 'table' and att.url then
         shareUrl = tostring(att.url)
     end
-    local fp = shareUrl ~= '' and ('u:' .. shareUrl)
-        or (tostring(obj.time or '') .. '|' .. nick .. '|' .. text)
-    if fp ~= '|' and rememberChatId(fp) then return end
+    if mid == '' then
+        if not obj.time then return end
+        local fp = tostring(obj.time)..'|'..cid..'|'..msg..'|'..shareUrl
+        if rememberChatId('fallback:'..fp) then return end
+    end
     if shareUrl ~= '' then
-        for _, m in ipairs(chatLines) do
-            if m.shareUrl == shareUrl then return end
-        end
         if text == '' or text:lower():find('file', 1, true) then
             text = 'База цен'
         end
@@ -4262,17 +4506,24 @@ local function ingestNtfyLine(line)
         return
     end
     if text == '' then return end
-    for i = #chatLines, math.max(1, #chatLines - 40), -1 do
-        local m = chatLines[i]
-        if m and not m.self and m.nick == nick and m.text == text then
-            return
-        end
-    end
     pushScriptChat(nick, text, false)
 end
 
-local function onPollResult(body, err, code)
+local function onPollResult(body, err, code, request)
+    if not refreshChatRoom() then
+        if request and request.token == chatState.inFlightToken then
+            chatState.inFlight=false
+            chatState.inFlightToken=nil
+            chatState.status='нет подключения'
+        end
+        return
+    end
+    if not request or request.generation ~= chatState.generation
+        or request.topic ~= chatState.topic or request.serverKey ~= chatState.serverKey
+        or request.token ~= chatState.inFlightToken then return end
     chatState.inFlight = false
+    chatState.inFlightToken = nil
+    if not chatOn[0] then return end
     code = tonumber(code) or 0
     if not body then
         if code == 429 then
@@ -4297,8 +4548,9 @@ local function onPollResult(body, err, code)
 end
 
 local function chatPollOnce()
-    if not chatOn[0] or chatState.inFlight then return end
+    if not chatOn[0] then return end
     local topic = refreshChatRoom()
+    if chatState.inFlight then return end
     if not topic or topic == '' then return end
     local url = 'https://ntfy.sh/' .. topic .. '/json?poll=1'
     if chatState.sinceId and chatState.sinceId ~= '' then
@@ -4307,36 +4559,54 @@ local function chatPollOnce()
         -- без since ntfy отдаёт ВЕСЬ кэш топика — при открытии это дублирует историю
         url = url .. '&since=30m'
     end
+    chatState.requestSeq = chatState.requestSeq + 1
+    local request = {generation=chatState.generation,topic=topic,serverKey=chatState.serverKey,token=chatState.requestSeq}
     chatState.inFlight = true
+    chatState.inFlightToken = request.token
     httpRequestAsync('GET', url, '', {
         ['User-Agent'] = 'ABarz/1.6',
         ['Accept'] = 'application/x-ndjson',
-    }, onPollResult)
+    }, function(body,err,code) onPollResult(body,err,code,request) end)
 end
 
-local function chatSendHttp(nick, text, onDone)
+local function chatSendHttp(nick, text, onDone, messageId)
     local topic = refreshChatRoom()
-    if not topic or topic == '' then return end
+    if not topic or topic == '' then if onDone then onDone('Нет подключения к серверу',0) end; return end
     local cid = ensureChatCid()
-    local payload = ('{"v":1,"cid":"%s","nick":"%s","text":"%s"}'):format(
-        jsonEsc(cid), jsonEsc(nick), jsonEsc(text))
-    httpRequestAsync('PUT', 'https://ntfy.sh/' .. topic, payload, {
-        ['User-Agent'] = 'ABarz/1.6',
-        ['Content-Type'] = 'text/plain; charset=utf-8',
-        ['Title'] = nick:sub(1, 64),
-    }, function(body, err, code)
-        if onDone then onDone(err, code) end
-    end)
+    if not messageId then
+        chatState.sendSeq = chatState.sendSeq + 1
+        messageId = cid..':'..tostring(chatState.sendSeq)
+    end
+    local payload = encodeJson({v=2,cid=cid,nick=nick,text=text,messageId=messageId})
+    httpRequestAsync('PUT','https://ntfy.sh/'..topic,payload,{
+        ['User-Agent']='ABarz/1.7.2', ['Content-Type']='text/plain; charset=utf-8',
+        ['Title']=chatState.truncate(nick,64),
+    },function(body,err,code) if onDone then onDone(err,code) end end)
+end
+
+function chatState.sendRow(row)
+    if not chatOn[0] or row.serverKey ~= chatState.serverKey then return end
+    row.delivery, row.error = 'sending', nil
+    chatSendHttp(row.nick,row.text,function(err,code)
+        if err then
+            if row.delivery ~= 'sent' then row.delivery, row.error = 'failed',tostring(err) end
+            if code == 429 and row.serverKey == chatState.serverKey then chatState.pollMs = 45000 end
+        else
+            row.delivery, row.error = 'sent',nil
+        end
+    end,row.messageId)
 end
 
 local function startChatPoller()
     if chatState.polling then return end
     if not ok_effil then
         pushScriptChat('Система', 'Чат недоступен.', false)
-        chat('Чат недоступен')
+        chat('Чат недоступен', 'error')
         chatOn[0] = false
         return
     end
+    chatState.pollerToken = chatState.pollerToken + 1
+    local token = chatState.pollerToken
     chatState.polling = true
     chatState.pollMs = 12000
     chatState.inFlight = false
@@ -4360,15 +4630,17 @@ local function startChatPoller()
         end
         -- первый poll чуть позже, чтобы не спамить при включении
         wait(800)
-        while chatOn[0] do
+        while chatOn[0] and token == chatState.pollerToken do
             pcall(chatPollOnce)
             local pause = tonumber(chatState.pollMs) or 12000
             if pause < 8000 then pause = 8000 end
             wait(pause)
         end
-        chatState.polling = false
-        chatState.inFlight = false
-        chatState.status = 'выкл'
+        if token == chatState.pollerToken then
+            chatState.polling = false
+            chatState.inFlight = false
+            chatState.status = 'выкл'
+        end
     end)
 end
 
@@ -4381,44 +4653,43 @@ local function setChatEnabled(on)
         chatState.pollMs = 12000
         startChatPoller()
         if chatOn[0] then
-            chat('Чат включён')
         end
     else
-        chat('Чат выключен')
+        chatState.generation = chatState.generation + 1
+        chatState.pollerToken = chatState.pollerToken + 1
+        chatState.polling, chatState.inFlight = false,false
+        chatState.inFlightToken = nil
+        chatState.status = 'выкл'
     end
 end
 
 local function sendScriptChat(raw)
     if not chatOn[0] then
-        chat('Сначала включи чат')
+        chat('Сначала включи чат', 'warning')
         return
     end
     if not ok_effil then
-        chat('Чат недоступен')
+        chat('Чат недоступен', 'error')
         return
     end
     raw = tostring(raw or ''):gsub('[\r\n]+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
     if raw == '' then return end
-    if #raw > 180 then raw = raw:sub(1, 180) end
+    raw = chatState.truncate(raw,180)
+    refreshChatRoom()
     local nick = myNickname()
-    pushScriptChat(nick, raw, true)
-    chatSendHttp(nick, raw, function(err, code)
-        if err then
-            if code == 429 then
-                chatState.pollMs = math.min(120000, 45000)
-                pushScriptChat('Система', 'Лимит отправки (429). Подожди немного.', false)
-            else
-                pushScriptChat('Система', 'Не отправилось: ' .. tostring(err), false)
-            end
-        end
-    end)
+    chatState.sendSeq = chatState.sendSeq + 1
+    local messageId = ensureChatCid()..':'..tostring(chatState.sendSeq)
+    local row = pushScriptChat(nick,raw,true)
+    row.messageId, row.serverKey = messageId,chatState.serverKey
+    chatState.outgoing[messageId] = row
+    chatState.sendRow(row)
 end
 
 local function startSharePrices()
     if shareState.busy then return end
     if not next(prices) then
         shareState.msg = 'база пустая'
-        chat('Нечем делиться — сначала скан или скачай чужую базу')
+        chat('Нечем делиться — сначала скан или скачай чужую базу', 'warning')
         return
     end
     if not chatOn[0] then
@@ -4426,12 +4697,12 @@ local function startSharePrices()
     end
     local topic = refreshChatRoom()
     if not topic or topic == '' then
-        chat('Не удалось определить сервер')
+        chat('Не удалось определить сервер', 'error')
         return
     end
     local payload, n = buildShareJson()
     if not payload or payload == '' then
-        chat('Не удалось собрать базу')
+        chat('Не удалось собрать базу', 'error')
         return
     end
     shareState.busy = true
@@ -4470,7 +4741,7 @@ local function startSharePrices()
         if why ~= '' and #why < 90 and not why:find('<', 1, true) then
             chat('Не удалось поделиться базой (' .. why .. ')')
         else
-            chat('Не удалось поделиться базой')
+            chat('Не удалось поделиться базой', 'error')
         end
     end, 60)
 end
@@ -4480,13 +4751,13 @@ local function startDownloadPrices(raw)
     raw = tostring(raw or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if raw == '' then
         shareState.msg = 'нет ссылки'
-        chat('В чате нет ссылки на базу')
+        chat('В чате нет ссылки на базу', 'warning')
         return
     end
     local url = resolveShareFetchUrl(raw)
     if not url then
         shareState.msg = 'непонятная ссылка'
-        chat('Непонятная ссылка на базу')
+        chat('Непонятная ссылка на базу', 'warning')
         return
     end
     shareState.busy = true
@@ -4502,7 +4773,7 @@ local function startDownloadPrices(raw)
             if why ~= '' and #why < 80 and not why:find('<', 1, true) then
                 chat('Не удалось скачать базу (' .. why .. ')')
             else
-                chat('Не удалось скачать базу')
+                chat('Не удалось скачать базу', 'error')
             end
             return
         end
@@ -4554,6 +4825,7 @@ scanState.saveSettings = function()
             chatOn = not not scanState.chatBindOn[0],
             mouseOn = not not scanState.mouseBindOn[0],
             autoOn = not not scanState.autoUpdateOn[0],
+            uiScale = scanState.uiScale or 1,
         }))
         f:close()
     end)
@@ -4573,6 +4845,8 @@ scanState.loadSettings = function()
         if data.menuOn ~= nil then scanState.menuBindOn[0] = not not data.menuOn end
         if data.chatOn ~= nil then scanState.chatBindOn[0] = not not data.chatOn end
         if data.mouseOn ~= nil then scanState.mouseBindOn[0] = not not data.mouseOn end
+        local scale = tonumber(data.uiScale)
+        if scale and scale == scale then scanState.uiScale = math.max(0.6, math.min(1.2, scale)) end
     end)
 end
 
@@ -4649,7 +4923,62 @@ scanState.pumpBinds = function()
     end
 end
 
+-- Logical coordinates keep every layout proportional without changing the shared module.
+function scanState.scaledUi(raw, getScale)
+    local ui = setmetatable({}, {__index=raw})
+    local function vec(v) local s=getScale(); return raw.ImVec2(v.x*s, v.y*s) end
+    local function logical(v) local s=getScale(); return raw.ImVec2(v.x/s, v.y/s) end
+    for _, name in ipairs({'SetCursorPos','SetNextWindowSize','Dummy'}) do
+        local method=name
+        ui[method]=function(v, ...) return raw[method](vec(v), ...) end
+    end
+    for _, name in ipairs({'SetCursorPosX','SetCursorPosY','SetNextItemWidth'}) do
+        local method=name
+        ui[method]=function(n) return raw[method](n*getScale()) end
+    end
+    for _, name in ipairs({'GetWindowPos','GetWindowSize','GetContentRegionAvail'}) do
+        local method=name
+        ui[method]=function() return logical(raw[method]()) end
+    end
+    ui.GetWindowWidth=function() return raw.GetWindowWidth()/getScale() end
+    ui.SetNextWindowPos=function(pos, cond, pivot) return raw.SetNextWindowPos(vec(pos),cond,pivot) end
+    ui.SameLine=function(offset, spacing)
+        return raw.SameLine(offset and offset*getScale() or 0,
+            spacing and spacing >= 0 and spacing*getScale() or -1)
+    end
+    ui.Button=function(label, size) return raw.Button(label, size and vec(size) or raw.ImVec2(0,0)) end
+    ui.Image=function(texture, size, ...) return raw.Image(texture,vec(size),...) end
+    ui.Begin=function(...)
+        local visible=raw.Begin(...); raw.SetWindowFontScale(getScale()); return visible
+    end
+    ui.BeginChild=function(id,size,...)
+        local visible=raw.BeginChild(id,vec(size),...); raw.SetWindowFontScale(getScale()); return visible
+    end
+    ui.SetWindowFontScale=function(n) raw.SetWindowFontScale(n*getScale()) end
+    ui.PushStyleVarFloat=function(key,n)
+        return raw.PushStyleVarFloat(key,key == raw.StyleVar.Alpha and n or n*getScale())
+    end
+    ui.PushStyleVarVec2=function(key,v) return raw.PushStyleVarVec2(key,vec(v)) end
+    ui.GetWindowDrawList=function()
+        local dl=raw.GetWindowDrawList()
+        return {
+            AddRectFilled=function(_,a,b,color,rounding,...)
+                return dl:AddRectFilled(vec(a),vec(b),color,(rounding or 0)*getScale(),...)
+            end,
+            AddCircleFilled=function(_,pos,radius,...)
+                return dl:AddCircleFilled(vec(pos),radius*getScale(),...)
+            end,
+        }
+    end
+    return ui
+end
+
 local function setupUi()
+local rawImgui = imgui
+local uiScale = 1
+local savedStyle
+local imgui = scanState.scaledUi(rawImgui, function() return uiScale end)
+local scalePercent = new.int(100)
 local searchBuf = new.char[64]()
 local dealModelBuf = new.char[64]()
 local dealSearchBuf = new.char[64]()
@@ -4666,10 +4995,11 @@ local WIN_W, WIN_H, SIDEBAR = 1020, 680, 176
 local CHAT_W, CHAT_H = 380, 470
 local accentCol = { 0.36, 0.58, 1.0 }
 local PAGES = {
-    { id = 'home', title = 'Обзор' },
-    { id = 'base', title = 'База' },
-    { id = 'scan', title = 'Скан' },
+    { id = 'base', title = 'Цены' },
+    { id = 'scan', title = 'Сканирование' },
     { id = 'deals', title = 'Сделки' },
+    { id = 'chat', title = 'Чат' },
+    { id = 'settings', title = 'Настройки' },
 }
 
 local function accent()
@@ -4700,6 +5030,7 @@ local function applyStyle()
     s.ItemSpacing = imgui.ImVec2(10, 8)
     s.ScrollbarSize = 8
     s.GrabMinSize = 10
+    s:ScaleAllSizes(uiScale)
     local c = s.Colors
     c[imgui.Col.Text] = imgui.ImVec4(0.94, 0.95, 0.97, 1)
     c[imgui.Col.TextDisabled] = imgui.ImVec4(0.54, 0.57, 0.63, 1)
@@ -4785,24 +5116,20 @@ local function dealTotals()
     return spent, earned
 end
 
-local function drawHome()
-    sectionTitle('Сводка')
-    local spent, earned = dealTotals()
-    metric('В базе', tostring(#priceList), 120)
-    imgui.SameLine()
-    metric('Сделок', tostring(#dealLogs), 120)
-    imgui.SameLine()
-    metric('Чат', chatOn[0] and 'онлайн' or 'выкл', 120)
-    imgui.SameLine()
-    metric('Скан', scanState.active and 'идёт' or 'стоп', 120)
-    spaced(0, 4)
-    imgui.TextDisabled(('Потрачено %s  ·  получено %s'):format(fmtMoney(spent), fmtMoney(earned)))
-    if scanState.active then
-        imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
-            ('Скан: стр. %d  %s'):format(scanState.index, tostring(scanState.currentName or '')))
-    end
+local baseTab, dealsTab, settingsTab = 1, 1, 1
 
-    spaced(0, 10)
+local function tabs(id, titles, current)
+    for i, title in ipairs(titles) do
+        if i > 1 then imgui.SameLine() end
+        if navButton(title .. '##' .. id .. i, current == i, 150) then current = i end
+    end
+    spaced(0, 6)
+    imgui.Separator()
+    spaced(0, 8)
+    return current
+end
+
+local function drawChatPage()
     sectionTitle('Чат сервера')
     spaced(0, 4)
     if actionButton(chatOn[0] and 'Закрыть чат' or 'Открыть чат', imgui.ImVec2(180, 32)) then
@@ -4820,24 +5147,47 @@ local function drawHome()
         imgui.TextDisabled('/abchat')
     end
 
-    spaced(0, 12)
-    sectionTitle('Обмен json')
-    spaced(0, 4)
-    if actionButton('Поделиться', imgui.ImVec2(150, 32)) then startSharePrices() end
-    if shareState.lastUrl ~= '' then
-        imgui.SameLine()
-        if actionButton('Копировать', imgui.ImVec2(130, 32)) then
-            copyShareUrl(shareState.lastUrl)
-            shareState.msg = 'ссылка скопирована'
-            chat(shareState.lastUrl)
-        end
-    end
-    if shareState.msg ~= '' then
-        imgui.TextDisabled(shareState.busy and '...' or shareState.msg)
-    end
+    spaced(0, 14)
+    imgui.TextWrapped('Сообщения сервера открываются в отдельном окне. Здесь можно включить или закрыть его.')
+    imgui.TextDisabled('Клавиши чата и мыши: Настройки → Клавиши.')
 end
 
 local function drawBase()
+    baseTab = tabs('base', {'Цены', 'Обмен базой', 'Хранение'}, baseTab)
+    if baseTab == 2 then
+        sectionTitle('Обмен базой цен')
+        spaced(0, 4)
+        if actionButton('Поделиться', imgui.ImVec2(150, 32)) then startSharePrices() end
+        if shareState.lastUrl ~= '' then
+            imgui.SameLine()
+            if actionButton('Копировать', imgui.ImVec2(130, 32)) then
+                copyShareUrl(shareState.lastUrl)
+                shareState.msg = 'ссылка скопирована'
+                chat(shareState.lastUrl)
+            end
+        end
+        if shareState.msg ~= '' then
+            imgui.TextDisabled(shareState.busy and '...' or shareState.msg)
+        end
+        spaced(0, 12)
+        imgui.TextWrapped('Поделитесь своей базой в чате сервера. Скачать чужую базу можно кнопкой у сообщения в чате.')
+        return
+    elseif baseTab == 3 then
+        sectionTitle('Хранение базы')
+        imgui.Text(('Сохранено моделей: %d'):format(#priceList))
+        imgui.TextDisabled('После сканирования база сохраняется автоматически.')
+        spaced(0, 12)
+        if actionButton('Сохранить базу', imgui.ImVec2(170,34)) then
+            rebuildList(); savePrices(); chat('База сохранена', 'success')
+        end
+        spaced(0, 20)
+        sectionTitle('Очистка базы')
+        imgui.TextWrapped('Удаляет сохранённые цены. История сделок остаётся.')
+        if dangerButton('Очистить базу', imgui.ImVec2(170,34)) then
+            prices={}; selectedName=nil; rebuildList(); savePrices(); chat('База очищена', 'success')
+        end
+        return
+    end
     sectionTitle('Цены автобазара')
     imgui.SetNextItemWidth(-1)
     if imgui.InputTextWithHint('##search', 'Поиск машины...', searchBuf, 64) then
@@ -4845,7 +5195,7 @@ local function drawBase()
     end
     spaced(0, 4)
     local rows = findPrices(filter)
-    local listH = WIN_H - 168
+    local listH = WIN_H - 224
     local leftW = 440
     imgui.BeginChild('##left', imgui.ImVec2(leftW, listH), true)
         imgui.TextDisabled(('Машины  ·  %d'):format(#rows))
@@ -4880,7 +5230,7 @@ local function drawBase()
             local prevW = math.floor(imgui.GetContentRegionAvail().x)
             if prevW < 280 then prevW = 280 end
             if prevW > 420 then prevW = 420 end
-            carImg.drawPreview(selectedName, prevW)
+            carImg.drawPreview(selectedName, prevW * uiScale, uiScale)
             spaced(0, 4)
             imgui.Separator()
             imgui.TextDisabled('Продажи по дням')
@@ -4901,69 +5251,219 @@ local function drawBase()
 end
 
 local function drawScan()
-    sectionTitle('Сканирование')
-    if scanState.active then
-        imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
-            ('Идёт скан: стр. %d  %s'):format(scanState.index, tostring(scanState.currentName or '')))
-    end
-    spaced(0, 6)
-    if actionButton('Сканировать', imgui.ImVec2(150, 34)) then requestScan() end
-    imgui.SameLine()
-    if actionButton('Стоп', imgui.ImVec2(90, 34)) then stopScan() end
-    imgui.SameLine()
-    if actionButton('Сохранить', imgui.ImVec2(120, 34)) then
-        rebuildList(); savePrices(); chat('База сохранена')
-    end
-    imgui.SameLine()
-    if dangerButton('Очистить', imgui.ImVec2(110, 34)) then
-        prices = {}; selectedName = nil; rebuildList(); savePrices(); chat('База очищена')
-    end
-
+    sectionTitle('Сканирование цен')
+    imgui.TextWrapped('Откройте на автобазаре список «Средняя цена автомобилей», затем запустите сканирование.')
     spaced(0, 14)
-    sectionTitle('Параметры')
-    imgui.Checkbox('Уведомлять о новых продажах', notifyNewSales)
-    imgui.Checkbox('Средняя цена в техпаспорте', showPassportAvg)
+    if scanState.active then
+        imgui.TextColored(accent(), 'Идёт сканирование — пожалуйста, подождите')
+        imgui.TextDisabled(tostring(scanState.currentName or 'Получение списка транспорта'))
+        imgui.TextDisabled('Примерное время: 5 минут. Результат сохраняется автоматически.')
+        spaced(0, 12)
+        if actionButton('Остановить', imgui.ImVec2(160,34)) then stopScan() end
+    else
+        imgui.TextDisabled(('Моделей в базе: %d'):format(#priceList))
+        spaced(0, 12)
+        if actionButton('Начать сканирование', imgui.ImVec2(220,34)) then requestScan() end
+    end
+    spaced(0, 24)
+    sectionTitle('Скорость сканирования')
     imgui.Text(('Пауза между кликами: %d мс'):format(tonumber(waitPageMs[0]) or 0))
     imgui.SetNextItemWidth(280)
     imgui.SliderInt('##wp', waitPageMs, 0, 40)
+end
 
-    spaced(0, 14)
-    sectionTitle('Бинды')
-    if scanState.bindWait then
-        imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), 'Нажми клавишу…  Esc — отмена')
-    end
-    if imgui.Checkbox('Меню ABarz', scanState.menuBindOn) then scanState.saveSettings() end
-    imgui.SameLine(168)
-    imgui.TextDisabled(scanState.keyName(scanState.menuVk))
-    imgui.SameLine(250)
-    if imgui.SmallButton(scanState.bindWait == 'menu' and '...' or 'Сменить##bm') then
-        scanState.bindWait = 'menu'
-    end
-    if imgui.Checkbox('Чат ABarz', scanState.chatBindOn) then scanState.saveSettings() end
-    imgui.SameLine(168)
-    imgui.TextDisabled(scanState.keyName(scanState.chatVk))
-    imgui.SameLine(250)
-    if imgui.SmallButton(scanState.bindWait == 'chat' and '...' or 'Сменить##bc') then
-        scanState.bindWait = 'chat'
-    end
-    if imgui.Checkbox('Мышь в чате', scanState.mouseBindOn) then scanState.saveSettings() end
-    imgui.SameLine(168)
-    imgui.TextDisabled(scanState.keyName(scanState.mouseVk))
-    imgui.SameLine(250)
-    if imgui.SmallButton(scanState.bindWait == 'mouse' and '...' or 'Сменить##bms') then
-        scanState.bindWait = 'mouse'
-    end
+local function drawSettings()
+    settingsTab = tabs('settings', {'Интерфейс', 'Клавиши', 'Обновления'}, settingsTab)
+    if settingsTab == 1 then
+        sectionTitle('Масштаб и отображение')
+        scalePercent[0] = math.floor((scanState.uiScale or 1) * 100 + 0.5)
+        imgui.SetNextItemWidth(220)
+        if imgui.SliderInt('Масштаб интерфейса', scalePercent, 60, 120, '%d%%') then
+            scanState.uiScale = scalePercent[0] / 100
+            scanState.saveSettings()
+        end
+        imgui.SameLine()
+        if imgui.SmallButton('100%##resetScale') then
+            scanState.uiScale = 1
+            scanState.saveSettings()
+        end
+        imgui.Checkbox('Уведомлять о новых продажах', notifyNewSales)
+        imgui.Checkbox('Средняя цена в техпаспорте', showPassportAvg)
+    elseif settingsTab == 2 then
+        sectionTitle('Горячие клавиши')
+        if scanState.bindWait then
+            imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), 'Нажми клавишу…  Esc — отмена')
+        end
+        if imgui.Checkbox('Меню ABarz', scanState.menuBindOn) then scanState.saveSettings() end
+        imgui.SameLine(168)
+        imgui.TextDisabled(scanState.keyName(scanState.menuVk))
+        imgui.SameLine(250)
+        if imgui.SmallButton(scanState.bindWait == 'menu' and '...' or 'Сменить##bm') then
+            scanState.bindWait = 'menu'
+        end
+        if imgui.Checkbox('Чат ABarz', scanState.chatBindOn) then scanState.saveSettings() end
+        imgui.SameLine(168)
+        imgui.TextDisabled(scanState.keyName(scanState.chatVk))
+        imgui.SameLine(250)
+        if imgui.SmallButton(scanState.bindWait == 'chat' and '...' or 'Сменить##bc') then
+            scanState.bindWait = 'chat'
+        end
+        if imgui.Checkbox('Мышь в чате', scanState.mouseBindOn) then scanState.saveSettings() end
+        imgui.SameLine(168)
+        imgui.TextDisabled(scanState.keyName(scanState.mouseVk))
+        imgui.SameLine(250)
+        if imgui.SmallButton(scanState.bindWait == 'mouse' and '...' or 'Сменить##bms') then
+            scanState.bindWait = 'mouse'
+        end
 
-    spaced(0, 14)
-    sectionTitle('Автообновление GitHub')
-    if imgui.Checkbox('Проверять через 45 сек после спавна', scanState.autoUpdateOn) then scanState.saveSettings() end
-    if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
-        scanState.checkUpdate(true)
+    else
+        sectionTitle('Автообновление GitHub')
+        if imgui.Checkbox('Проверять через 45 сек после спавна', scanState.autoUpdateOn) then scanState.saveSettings() end
+        if actionButton(scanState.updateBusy and 'Проверяю...' or 'Проверить сейчас', imgui.ImVec2(200, 32)) then
+            scanState.checkUpdate(true)
+        end
     end
 end
 
 local function drawDeals()
-    sectionTitle('Логи сделок')
+    dealsTab = tabs('deals', {'История', 'Мои лоты', 'Добавить сделку'}, dealsTab)
+    local unresolved = 0
+    for _, entry in ipairs(pendingSell.confirmations) do
+        if entry.state == 'unresolved' then unresolved = unresolved + 1 end
+    end
+    if unresolved > 0 and dealsTab ~= 2 then
+        imgui.TextColored(imgui.ImVec4(1,0.76,0.3,1), ('Сделок для уточнения: %d'):format(unresolved))
+        imgui.SameLine()
+        if imgui.SmallButton('Уточнить сделки') then dealsTab = 2 end
+        spaced(0, 6)
+    end
+    if dealsTab == 2 then
+        sectionTitle('Лоты и подтверждения')
+        local nLots = #(pendingSell.lots or {})
+        for _, entry in ipairs(pendingSell.confirmations) do
+            if entry.state == 'unresolved' then
+                imgui.PushIDStr(entry.id)
+                imgui.TextColored(imgui.ImVec4(1,0.76,0.3,1),
+                    (entry.action=='buy' and 'Покупка' or 'Продажа')..' подтверждена — уточните данные')
+                for _, candidate in ipairs(entry.candidates or {}) do
+                    if isGenericCarName(candidate.model) then
+                        imgui.TextDisabled('Модель не определена · '..fmtMoney(candidate.price))
+                    elseif imgui.SmallButton(candidate.model..' · '..fmtMoney(candidate.price)..'##'..candidate.id) then
+                        pendingSell.resolve(entry.id,candidate.id)
+                    end
+                end
+                if imgui.SmallButton('Внести данные вручную') then
+                    scanState.manualConfirmation=entry.id
+                    dealsTab=3
+                    setCString(dealModelBuf,64,entry.model or '')
+                    setCString(dealPriceBuf,32,tostring(entry.price or ''))
+                end
+                imgui.SameLine()
+                if imgui.SmallButton('Пропустить') then
+                    entry.state='dismissed'
+                    if scanState.manualConfirmation == entry.id then scanState.manualConfirmation=nil end
+                    saveDealLogs()
+                end
+                imgui.PopID()
+            end
+        end
+        if nLots > 0 then
+            imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
+                ('На АБ  %d'):format(nLots))
+            for i = 1, nLots do
+                local lot = pendingSell.lots[i]
+                imgui.Text(('  %s  ·  %s'):format(
+                    (lot.model ~= '' and lot.model) or 'транспорт',
+                    fmtMoney(lot.price)))
+                imgui.SameLine(320)
+                if imgui.SmallButton('Убрать из учёта##' .. i) then
+                    pendingSell.removeLot(i)
+                    chat('Лот убран из памяти (машина на АБ не снимается)')
+                    break
+                end
+            end
+        else
+            imgui.TextDisabled('В этой сессии нет учтённых лотов на автобазаре')
+        end
+
+        return
+    elseif dealsTab == 3 then
+        sectionTitle('Добавить сделку')
+        if scanState.manualConfirmation then
+            imgui.TextDisabled('Уточнение подтверждённой сделки')
+            imgui.SameLine()
+            if imgui.SmallButton('Отменить уточнение') then scanState.manualConfirmation=nil end
+        end
+        local pickedModel = ffi.string(dealModelBuf)
+        imgui.SetNextItemWidth(280)
+        if imgui.BeginCombo('##dealmodel', pickedModel ~= '' and pickedModel or 'модель из базы') then
+            if imgui.IsWindowAppearing() then imgui.SetKeyboardFocusHere() end
+            imgui.SetNextItemWidth(-1)
+            imgui.InputTextWithHint('##dealmsearch', 'поиск по базе...', dealSearchBuf, 64)
+            local rows = findPrices(ffi.string(dealSearchBuf))
+            if #priceList == 0 then
+                imgui.TextDisabled('Сначала скан — список из средних цен')
+            elseif #rows == 0 then
+                imgui.TextDisabled('Нет совпадений')
+            else
+                for i = 1, math.min(#rows, 80) do
+                    local row = rows[i]
+                    local name = row.name
+                    local sel = name == pickedModel
+                    if imgui.Selectable(('%s  %s'):format(name, fmtMoney(row.price)), sel) then
+                        setCString(dealModelBuf, 64, name)
+                        dealSearchBuf[0] = 0
+                    end
+                    if sel then imgui.SetItemDefaultFocus() end
+                end
+            end
+            imgui.EndCombo()
+        end
+        imgui.SameLine()
+        imgui.SetNextItemWidth(140)
+        imgui.InputTextWithHint('##dealprice', 'цена, 12кк', dealPriceBuf, 32)
+        local function submitManual(action)
+            local model = normalizeName(ffi.string(dealModelBuf))
+            if model == '' then
+                local q = normalizeName(ffi.string(dealSearchBuf))
+                if q ~= '' then
+                    local rows = findPrices(q)
+                    if #rows == 1 then model = rows[1].name else model = q end
+                end
+            end
+            local priceRaw = ffi.string(dealPriceBuf)
+            local price = parseAbbrevPrice(priceRaw) or cleanPriceNum(priceRaw)
+            if model == '' then
+                chat('Выбери модель из базы', 'warning')
+                return
+            end
+            if not price or price <= 0 then
+                chat('Укажи цену (можно 12кк)', 'warning')
+                return
+            end
+            if scanState.manualConfirmation then
+                local found=false
+                for _,entry in ipairs(pendingSell.confirmations) do
+                    if entry.id == scanState.manualConfirmation and entry.action == action then found=true; break end
+                end
+                if not found then chat('Выберите действие, соответствующее подтверждённой сделке.'); return end
+                if not pendingSell.resolve(scanState.manualConfirmation,nil,model,price) then return end
+                scanState.manualConfirmation=nil
+            else
+                addDeal(action, model, price, 'manual')
+            end
+            dealModelBuf[0] = 0
+            dealSearchBuf[0] = 0
+            dealPriceBuf[0] = 0
+        end
+        if actionButton('Купил', imgui.ImVec2(110, 28)) then submitManual('buy') end
+        imgui.SameLine()
+        if actionButton('Продал', imgui.ImVec2(110, 28)) then submitManual('sell') end
+        imgui.TextDisabled('Модель — из базы средних цен. Если сделки нет в логе — внеси сюда.')
+
+        return
+    end
+    sectionTitle('История сделок')
     local spent, earned = dealTotals()
     metric('Сделок', tostring(#dealLogs), 130)
     imgui.SameLine()
@@ -4971,87 +5471,7 @@ local function drawDeals()
     imgui.SameLine()
     metric('Получено', fmtMoney(earned), 170)
     spaced(0, 6)
-    local nLots = #(pendingSell.lots or {})
-    if nLots > 0 then
-        imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
-            ('На АБ  %d/2'):format(nLots))
-        for i = 1, nLots do
-            local lot = pendingSell.lots[i]
-            imgui.Text(('  %s  ·  %s'):format(
-                (lot.model ~= '' and lot.model) or 'транспорт',
-                fmtMoney(lot.price)))
-            imgui.SameLine(320)
-            if imgui.SmallButton('снять##' .. i) then
-                pendingSell.removeLot(i)
-                chat('Лот убран из памяти (машина на АБ не снимается)')
-                break
-            end
-        end
-    else
-        imgui.TextDisabled('Сейчас на АБ ничего не выставлено (из сохранения)')
-    end
-
-    spaced(0, 8)
-    sectionTitle('Добавить сделку')
-    local pickedModel = ffi.string(dealModelBuf)
-    imgui.SetNextItemWidth(280)
-    if imgui.BeginCombo('##dealmodel', pickedModel ~= '' and pickedModel or 'модель из базы') then
-        if imgui.IsWindowAppearing() then imgui.SetKeyboardFocusHere() end
-        imgui.SetNextItemWidth(-1)
-        imgui.InputTextWithHint('##dealmsearch', 'поиск по базе...', dealSearchBuf, 64)
-        local rows = findPrices(ffi.string(dealSearchBuf))
-        if #priceList == 0 then
-            imgui.TextDisabled('Сначала скан — список из средних цен')
-        elseif #rows == 0 then
-            imgui.TextDisabled('Нет совпадений')
-        else
-            for i = 1, math.min(#rows, 80) do
-                local row = rows[i]
-                local name = row.name
-                local sel = name == pickedModel
-                if imgui.Selectable(('%s  %s'):format(name, fmtMoney(row.price)), sel) then
-                    setCString(dealModelBuf, 64, name)
-                    dealSearchBuf[0] = 0
-                end
-                if sel then imgui.SetItemDefaultFocus() end
-            end
-        end
-        imgui.EndCombo()
-    end
-    imgui.SameLine()
-    imgui.SetNextItemWidth(140)
-    imgui.InputTextWithHint('##dealprice', 'цена, 12кк', dealPriceBuf, 32)
-    local function submitManual(action)
-        local model = normalizeName(ffi.string(dealModelBuf))
-        if model == '' then
-            local q = normalizeName(ffi.string(dealSearchBuf))
-            if q ~= '' then
-                local rows = findPrices(q)
-                if #rows == 1 then model = rows[1].name else model = q end
-            end
-        end
-        local priceRaw = ffi.string(dealPriceBuf)
-        local price = parseAbbrevPrice(priceRaw) or cleanPriceNum(priceRaw)
-        if model == '' then
-            chat('Выбери модель из базы')
-            return
-        end
-        if not price or price <= 0 then
-            chat('Укажи цену (можно 12кк)')
-            return
-        end
-        addDeal(action, model, price, 'manual')
-        dealModelBuf[0] = 0
-        dealSearchBuf[0] = 0
-        dealPriceBuf[0] = 0
-    end
-    if actionButton('Купил', imgui.ImVec2(110, 28)) then submitManual('buy') end
-    imgui.SameLine()
-    if actionButton('Продал', imgui.ImVec2(110, 28)) then submitManual('sell') end
-    imgui.TextDisabled('Модель — из базы средних цен. Если сделки нет в логе — внеси сюда.')
-
-    spaced(0, 6)
-    imgui.BeginChild('##deals', imgui.ImVec2(-1, WIN_H - 330), true)
+    imgui.BeginChild('##deals', imgui.ImVec2(-1, WIN_H - 310), true)
         if #dealLogs == 0 then
             imgui.TextDisabled('Пока пусто')
         else
@@ -5084,15 +5504,16 @@ local function drawDeals()
     if dangerButton('Очистить сделки', imgui.ImVec2(180, 32)) then
         dealLogs = {}
         saveDealLogs()
-        chat('Логи сделок очищены')
+        chat('Логи сделок очищены', 'success')
     end
 end
 
 local PAGE_DRAW = {
-    home = drawHome,
     base = drawBase,
     scan = drawScan,
     deals = drawDeals,
+    chat = drawChatPage,
+    settings = drawSettings,
 }
 
 scanState.forumUrl = 'https://www.blast.hk/threads/257682/#post-1695478'
@@ -5172,10 +5593,10 @@ function scanState.ensureEventsLib()
         end
     end
     if not okAll then
-        chat('Не удалось скачать arizona-events. CEF будет ограничен.')
+        chat('Не удалось скачать arizona-events. CEF будет ограничен.', 'error')
         return false
     end
-    chat('Библиотеки обновлены. Перезапуск скрипта…')
+    chat('Библиотеки обновлены. Перезапуск скрипта…', 'success')
     wait(300)
     thisScript():reload()
     return true
@@ -5323,10 +5744,6 @@ local function drawSidebar()
             imgui.SetCursorPosX(12)
             if navButton(p.title, page == i, SIDEBAR - 24) then page = i end
         end
-        imgui.SetCursorPos(imgui.ImVec2(12, WIN_H - 118))
-        if navButton(chatOn[0] and 'Чат  ·  вкл' or 'Чат', chatOn[0], SIDEBAR - 24) then
-            setChatEnabled(not chatOn[0])
-        end
         imgui.SetCursorPos(imgui.ImVec2(12, WIN_H - 80))
         imgui.SetWindowFontScale(0.86)
         if navButton('Тема на blast.hk', false, SIDEBAR - 24) then
@@ -5358,7 +5775,7 @@ local function drawChatWindow(sw, sh)
     local st = imgui.GetStyle()
     st.WindowPadding = imgui.ImVec2(14, 12)
     imgui.SetNextWindowPos(imgui.ImVec2(sw - 20, sh / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(1.0, 0.5))
-    imgui.SetNextWindowSize(imgui.ImVec2(CHAT_W, CHAT_H), imgui.Cond.FirstUseEver)
+    imgui.SetNextWindowSize(imgui.ImVec2(CHAT_W, CHAT_H), imgui.Cond.Always)
     local flags = bit.bor(imgui.WindowFlags.NoCollapse, imgui.WindowFlags.NoTitleBar)
     if not chatState.wantMouse then
         local extra = imgui.WindowFlags.NoMouseInputs or imgui.WindowFlags.NoInputs
@@ -5420,6 +5837,14 @@ local function drawChatWindow(sw, sh)
                         imgui.TextWrapped(shown)
                     end
                 end
+                if m.self and m.delivery == 'sending' then
+                    imgui.TextDisabled('Отправляется...')
+                elseif m.self and m.delivery == 'failed' then
+                    imgui.TextDisabled('Не отправлено')
+                    imgui.SameLine()
+                    if imgui.SmallButton('Повторить') then chatState.sendRow(m) end
+                    if imgui.IsItemHovered() then imgui.SetTooltip(tostring(m.error or 'Ошибка отправки')) end
+                end
                 if hasFile then
                     imgui.SameLine()
                     if imgui.SmallButton('Скачать') then
@@ -5447,10 +5872,51 @@ local function drawChatWindow(sw, sh)
         end
         if imgui.Button('Очистить чат', imgui.ImVec2(140, 26)) then
             chatLines = {}
+            chatState.outgoing = {}
         end
     end
     imgui.End()
     st.WindowPadding = imgui.ImVec2(0, 0)
+end
+
+local function drawScanNotice(sw, sh)
+    local width = math.min(480, sw - 32)
+    local height = 112
+    imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh - 28), imgui.Cond.Always, imgui.ImVec2(0.5, 1))
+    imgui.SetNextWindowSize(imgui.ImVec2(width, height), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 12)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(18, 14))
+    imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0.055, 0.07, 0.105, 0.97))
+    imgui.PushStyleColor(imgui.Col.Border, imgui.ImVec4(0.36, 0.58, 1, 0.35))
+    local flags = bit.bor(imgui.WindowFlags.NoDecoration, imgui.WindowFlags.NoInputs,
+        imgui.WindowFlags.NoMove, imgui.WindowFlags.NoSavedSettings,
+        imgui.WindowFlags.NoFocusOnAppearing, imgui.WindowFlags.NoBringToFrontOnFocus)
+    if imgui.Begin('##abarzScanNotice', nil, flags) then
+        local pos = imgui.GetWindowPos()
+        local dl = imgui.GetWindowDrawList()
+        local pulse = 0.65 + 0.35 * math.sin(os.clock() * 3)
+        dl:AddCircleFilled(imgui.ImVec2(pos.x + 21, pos.y + 23), 3.5,
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.42, 0.68, 1, pulse)), 16)
+        imgui.SetCursorPos(imgui.ImVec2(34, 14))
+        imgui.TextColored(imgui.ImVec4(0.7, 0.83, 1, 1), 'Идёт сканирование')
+        imgui.SetCursorPos(imgui.ImVec2(18, 40))
+        imgui.Text('Пожалуйста, подождите.')
+        imgui.SetCursorPos(imgui.ImVec2(18, 63))
+        imgui.TextDisabled('Примерное время сканирования — 5 минут.')
+        local track = width - 36
+        local y = pos.y + height - 13
+        dl:AddRectFilled(imgui.ImVec2(pos.x + 18, y), imgui.ImVec2(pos.x + width - 18, y + 3),
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, 0.08)), 2)
+        local bar = track * 0.28
+        local x = (os.clock() * 0.3 % 1) * (track + bar) - bar
+        dl:AddRectFilled(imgui.ImVec2(pos.x + 18 + math.max(0, x), y),
+            imgui.ImVec2(pos.x + 18 + math.min(track, x + bar), y + 3),
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.36, 0.64, 1, 0.95)), 2)
+    end
+    imgui.End()
+    imgui.PopStyleColor(2)
+    imgui.PopStyleVar(3)
 end
 
 imgui.OnInitialize(function()
@@ -5470,8 +5936,16 @@ imgui.OnFrame(function()
         chatOn[0] = false
         return false
     end
-    return win[0] or chatOn[0]
+    return win[0] or chatOn[0] or scanState.active
 end, function(player)
+    local sw, sh = getScreenResolution()
+    uiScale = math.min(math.max(0.6, math.min(1.2, scanState.uiScale or 1)),
+        math.max(0.3, math.min((sw - 32) / WIN_W, (sh - 32) / WIN_H)))
+    sw, sh = sw / uiScale, sh / uiScale
+    -- Restore shared styles after drawing so library notifications keep their size.
+    local sharedStyle = rawImgui.GetStyle()
+    savedStyle = savedStyle or ffi.new('ImGuiStyle[1]')
+    ffi.copy(savedStyle, sharedStyle, ffi.sizeof('ImGuiStyle'))
     -- меню ABarz — курсор; один чат — камера свободна, бинд мыши включает курсор
     local wantMouse = win[0] and true or false
     if (not wantMouse) and chatOn[0] and scanState.mouseBindOn[0] then
@@ -5485,7 +5959,6 @@ end, function(player)
     player.HideCursor = not wantMouse
     player.LockPlayer = false
     applyStyle()
-    local sw, sh = getScreenResolution()
 
     if win[0] then
         imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
@@ -5514,6 +5987,8 @@ end, function(player)
     if chatOn[0] then
         drawChatWindow(sw, sh)
     end
+    if scanState.active then drawScanNotice(sw, sh) end
+    ffi.copy(sharedStyle, savedStyle, ffi.sizeof('ImGuiStyle'))
 end)
 
 end
@@ -5545,15 +6020,25 @@ function main()
     saleAlive = true
     chat(('AutoABarz загружен. /abarz — в базе: %d'):format(#priceList))
     if scanState.menuBindOn[0] then
-        chat(('Бинд меню: %s  ·  чат: %s  (Скан -> Бинды)'):format(
+        chat(('Бинд меню: %s  ·  чат: %s  (Настройки → Клавиши)'):format(
             scanState.keyName(scanState.menuVk),
             scanState.chatBindOn[0] and scanState.keyName(scanState.chatVk) or 'выкл'))
     end
+    if ntfy and ntfy.configure then
+        pcall(ntfy.configure, {
+            sale_window = 120,
+            sale_threshold = 3,
+            position = 'bottom_left',
+            default_duration = 8000,
+        })
+    else
+        chat('Библиотека notifications недоступна. Уведомления записываются в moonloader.log.', 'error')
+    end
     if not ok_arz then
-        chat('Нет arizona-events (lib) — CEF будет ограничен')
+        chat('Нет arizona-events (lib) — CEF будет ограничен', 'warning')
     end
     if not ok_cef then
-        chat('Нет arizona-cef-dialogs (lib) — CEF-диалоги могут не читаться')
+        chat('Нет arizona-cef-dialogs (lib) — CEF-диалоги могут не читаться', 'warning')
     end
 
     sampRegisterChatCommand('abarz', function() win[0] = not win[0] end)
