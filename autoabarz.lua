@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.8.0')
+script_version('1.8.1')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -5994,6 +5994,72 @@ end)
 end
 setupUi()
 
+
+-- Install the optional UI library once; this does not update the script itself.
+function scanState.ensureNotifications()
+    if ntfy and type(ntfy.show) == 'function' and type(ntfy.sale) == 'function' then return false end
+    local function status(text)
+        sampAddChatMessage('{5B8CFF}[ABarz] {FFFFFF}' .. d(text), -1)
+    end
+    local path = getWorkingDirectory() .. '\\lib\\notifications.lua'
+    if doesFileExist(path) then
+        status('Не удалось загрузить notifications.lua. Проверьте её зависимости в moonloader.log.')
+        return false
+    end
+    status('Качаю библиотеку уведомлений, пожалуйста, подождите…')
+    ensureDir(getWorkingDirectory() .. '\\lib')
+    local okMoon, moon = pcall(require, 'moonloader')
+    if not okMoon then okMoon, moon = pcall(require, 'lib.moonloader') end
+    local ds = okMoon and moon.download_status
+    if type(downloadUrlToFile) ~= 'function' or not ds then
+        status('Не удалось скачать библиотеку уведомлений. Установите lib/notifications.lua вручную.')
+        return false
+    end
+    local urls = {
+        'https://raw.githubusercontent.com/andergr0ynd/autoabarz/main/lib/notifications.lua',
+        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/lib/notifications.lua',
+    }
+    local installed = false
+    for i, url in ipairs(urls) do
+        local part = path .. '.' .. tostring(os.time()) .. '.' .. tostring(math.random(100000,999999)) .. '.part'
+        local job = {done=false, success=false}
+        local started, err = pcall(downloadUrlToFile, url, part, function(_, state)
+            if state == ds.STATUS_ENDDOWNLOADDATA or state == ds.STATUSEX_ENDDOWNLOAD then
+                job.success, job.done = true, true
+            elseif state == ds.STATUS_ERROR or state == ds.STATUSEX_ERROR then
+                job.done = true
+            end
+        end)
+        if not started then print('ABarz notifications download: ' .. tostring(err)) end
+        local elapsed = 0
+        while started and not job.done and elapsed < 25000 do
+            wait(50)
+            elapsed = elapsed + 50
+        end
+        if job.success then
+            local f = io.open(part, 'rb')
+            local body = f and f:read('*a') or ''
+            if f then f:close() end
+            local compiled = loadfile(part)
+            if compiled and #body > 1000 and body:find('return notifications',1,true) then
+                -- Another instance may have installed it while this request was running.
+                installed = doesFileExist(path) or os.rename(part, path) ~= nil
+            end
+        end
+        pcall(os.remove, part)
+        if installed then break end
+    end
+    if not installed then
+        status('Не удалось скачать библиотеку уведомлений. Установите lib/notifications.lua вручную.')
+        return false
+    end
+    status('Библиотека уведомлений установлена. Перезапускаю скрипт…')
+    -- Register notification fonts before mimgui initializes on the next load.
+    wait(300)
+    thisScript():reload()
+    return true
+end
+
 local CMDS = { 'abarz', 'abscan', 'abchat', 'abprice', 'carprice', 'abupdate' }
 
 local function unregisterCmds()
@@ -6004,6 +6070,7 @@ end
 
 function main()
     while not isSampAvailable() do wait(0) end
+    if scanState.ensureNotifications() then return end
     if scanState.ensureEventsLib() then return end
     scanState.loadArizonaEvents()
     loadPrices()
