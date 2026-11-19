@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.8.1')
+script_version('1.9.2')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -144,7 +144,8 @@ local function safeDecodeJson(raw)
 end
 
 local DATA_DIR = getWorkingDirectory() .. '\\config\\abarz'
-local DATA_FILE = DATA_DIR .. '\\prices.json'
+local LEGACY_PRICES_FILE = DATA_DIR .. '\\prices.json'
+local DATA_FILE
 local LOGS_FILE = DATA_DIR .. '\\deals.json'
 local dealLogs = {}
 local knownPlates = {}
@@ -152,15 +153,18 @@ local incomingChat = {}
 local incomingDlg = {}
 local incomingCef = {}
 local pendingBuy = { active = false, model = '', price = 0, t = 0, source = '' }
-local pendingSell = { lots = {}, max = 2, draftModel = '', muteNtfy = 0, confirmations = {}, sequence = 0, details = {} }
+local pendingSell = { lots = {}, max = 32, draftModel = '', muteNtfy = 0, confirmations = {}, sequence = 0, details = {} }
 local needSellSnapshot = false
 ensureDir(DATA_DIR)
 
 -- Превью машин в «База»: методы на таблице (не local function — лимит 200 locals).
--- Свои картинки: config/abarz/cars/<имя>.jpg|png (пробелы → _).
+-- Official images are cached separately from legacy wiki pictures.
+-- Optional custom pictures: config/abarz/cars/custom/<имя>.jpg|png.
 local carImg = {
     dir = DATA_DIR .. '\\cars',
     mapFile = DATA_DIR .. '\\vehicles.json',
+    officialDir = DATA_DIR .. '\\cars\\arizona',
+    customDir = DATA_DIR .. '\\cars\\custom',
     -- Arizona CDN: .../inventory/vehicles/512/{server_id}.png
     cdn = {
         'https://cdn.azresources.cloud/projects/arizona-rp/assets/images/inventory/vehicles/512/',
@@ -175,6 +179,8 @@ local carImg = {
     pending = nil,
 }
 ensureDir(carImg.dir)
+ensureDir(carImg.officialDir)
+ensureDir(carImg.customDir)
 
 local waitPageMs = new.int(0)
 local notifyNewSales = new.bool(true)
@@ -220,6 +226,161 @@ scanState.bindHeld = {}
 scanState.updateBusy = false
 scanState.forceCloseUi = false
 
+function scanState.readUiMouse()
+    if not scanState.uiMouseBackend then
+        pcall(ffi.cdef,[[
+            typedef struct { long x; long y; } ABarzMousePoint;
+            int __stdcall GetCursorPos(ABarzMousePoint*);
+            int __stdcall ScreenToClient(void*, ABarzMousePoint*);
+            void* __stdcall GetForegroundWindow(void);
+            short __stdcall GetAsyncKeyState(int);
+        ]])
+        scanState.uiMouseBackend=ffi.load('user32')
+    end
+    local backend=scanState.uiMouseBackend
+    local hwnd=ffi.cast('void*',readMemory(0x00C8CF88,4,false))
+    if hwnd==nil or backend.GetForegroundWindow()~=hwnd then return end
+    local point=ffi.new('ABarzMousePoint[1]')
+    if backend.GetCursorPos(point)==0 or backend.ScreenToClient(hwnd,point)==0 then return end
+    return tonumber(point[0].x),tonumber(point[0].y),
+        bit.band(backend.GetAsyncKeyState(1),0x8000)~=0,
+        bit.band(backend.GetAsyncKeyState(2),0x8000)~=0,
+        bit.band(backend.GetAsyncKeyState(4),0x8000)~=0
+end
+
+function scanState.syncUiMouse(io)
+    local ok,x,y,left,right,middle=pcall(scanState.readUiMouse)
+    if not ok then return false end
+    if x and y then io.MousePos.x,io.MousePos.y=x,y end
+    io.MouseDown[0],io.MouseDown[1],io.MouseDown[2]=not not left,not not right,not not middle
+    return x~=nil
+end
+
+-- The launcher can return either a DNS name or the IP of the same server.
+-- Keep one identity for chat and marketplace; never use the displayed server name.
+-- Official PC launcher server list; DNS addresses verified on 18.11.2026.
+scanState.servers = {
+    {'Phoenix','phoenix','185.169.134.3'}, {'Tucson','tucson','185.169.134.4'},
+    {'Scottdale','scottdale','185.169.134.43'}, {'Chandler','chandler','185.169.134.44'},
+    {'Brainburg','brainburg','185.169.134.45'}, {'Saint Rose','saintrose','185.169.134.5'},
+    {'Mesa','mesa','185.169.134.59'}, {'Red-Rock','redrock','185.169.134.61'},
+    {'Yuma','yuma','185.169.134.107'}, {'Surprise','surprise','185.169.134.109'},
+    {'Prescott','prescott','185.169.134.166'}, {'Glendale','glendale','185.169.134.171'},
+    {'Kingman','kingman','185.169.134.172'}, {'Winslow','winslow','185.169.134.173'},
+    {'Payson','payson','185.169.134.174'}, {'Gilbert','gilbert','80.66.82.191'},
+    {'Show-Low','showlow','80.66.82.190'}, {'Casa Grande','casagrande','80.66.82.188'},
+    {'Page','page','80.66.82.168'}, {'Sun City','suncity','80.66.82.159'},
+    {'Queen Creek','queencreek','80.66.82.200'}, {'Sedona','sedona','80.66.82.144'},
+    {'Holiday','holiday','80.66.82.132'}, {'Wednesday','wednesday','80.66.82.128'},
+    {'Yava','yava','80.66.82.113'}, {'Faraway','faraway','80.66.82.82'},
+    {'Bumble Bee','bumblebee','80.66.82.87'}, {'Christmas','christmas','80.66.82.54'},
+    {'Mirage','mirage','80.66.82.39'}, {'Love','love','80.66.82.33'},
+    {'Drake','drake','80.66.82.22'}, {'Space','space','80.66.82.199'},
+    {'Vice City',nil,'80.66.82.147'},
+    {'Home','home','80.66.82.235',33},
+}
+scanState.serverAliases = {}
+for _,server in ipairs(scanState.servers) do
+    if server[2] then scanState.serverAliases[server[2]..'.arizona-rp.com']=server[3] end
+end
+function scanState.canonicalServerHost(host)
+    host=tostring(host or ''):lower():gsub('^%s+',''):gsub('%s+$','')
+    host=(host:match('^([^:]+):%d+$') or host):gsub('%.$','')
+    return scanState.serverAliases[host] or host
+end
+
+function scanState.pricesIdentity(host,port)
+    if host==nil then
+        if type(sampGetCurrentServerAddress)~='function' then return end
+        if type(sampGetGamestate)=='function' and sampGetGamestate()~=3 then return end
+        local ok
+        ok,host,port=pcall(sampGetCurrentServerAddress)
+        if not ok then return end
+    end
+    host,port=scanState.canonicalServerHost(host),tonumber(port)
+    if host=='' or host=='0.0.0.0' or not port or port<=0 then return end
+    local slug=host:gsub('[^%w%-]','-')
+    for _,server in ipairs(scanState.servers) do
+        if server[3]==host then slug=server[2] or 'vice-city'; break end
+    end
+    if port~=7777 then slug=slug..'-'..port end
+    return {room=host..':'..port,vice=host=='80.66.82.147',
+        path=DATA_DIR..'\\prices\\'..slug..'.json'}
+end
+
+function scanState.acquireInstance()
+    if scanState.instanceHandle then return true end
+    local ok,acquired=pcall(function()
+        pcall(ffi.cdef,'void* __stdcall CreateMutexA(void*, int, const char*);')
+        pcall(ffi.cdef,'unsigned long __stdcall GetLastError(void);')
+        pcall(ffi.cdef,'unsigned long __stdcall GetCurrentProcessId(void);')
+        pcall(ffi.cdef,'int __stdcall CloseHandle(void*);')
+        local kernel=scanState.instanceKernel or ffi.load('kernel32')
+        local name='Local\\AutoABarz-instance-'..tonumber(kernel.GetCurrentProcessId())
+        local handle=kernel.CreateMutexA(nil,0,name)
+        local exists=tonumber(kernel.GetLastError())==183
+        if handle==nil or handle==ffi.NULL then return true end
+        if exists then kernel.CloseHandle(handle); return false end
+        scanState.instanceKernel,scanState.instanceHandle=kernel,handle
+        return true
+    end)
+    if ok and not acquired then scanState.duplicateInstance=true; return false end
+    scanState.duplicateInstance=nil
+    return true
+end
+
+function scanState.releaseInstance()
+    if scanState.instanceHandle then
+        scanState.instanceKernel.CloseHandle(scanState.instanceHandle)
+        scanState.instanceHandle=nil
+    end
+end
+
+function scanState.isViceCity()
+    local ip, name
+    if type(sampGetCurrentServerAddress) == 'function' then
+        local ok, value = pcall(sampGetCurrentServerAddress)
+        if ok then ip = scanState.canonicalServerHost(value) end
+    end
+    if ip and ip ~= '' and ip ~= '0.0.0.0' then return ip == '80.66.82.147' end
+    if type(sampGetCurrentServerName) == 'function' then
+        local ok, value = pcall(sampGetCurrentServerName)
+        if ok then name = ensure_utf8(tostring(value or '')) end
+    end
+    return name and name:lower():gsub('[%s%-%|_%.]+', ''):find('vicecity', 1, true) ~= nil or false
+end
+
+function scanState.dealsPath()
+    local vice = scanState.marketProfile == 'vice'
+        or (not scanState.marketProfile and scanState.isViceCity())
+    return vice and (DATA_DIR .. '\\deals-vice-city.json') or LOGS_FILE
+end
+
+function scanState.listingSession()
+    if type(sampGetGamestate)~='function' or sampGetGamestate()~=3
+        or type(sampGetPlayerIdByCharHandle)~='function' or type(sampGetCurrentServerAddress)~='function'
+        or type(pendingSell.localNick)~='function' then return end
+    if not scanState.processId then
+        pcall(ffi.cdef,'unsigned long __stdcall GetCurrentProcessId(void);')
+        local ok,value=pcall(function() return tonumber(ffi.load('kernel32').GetCurrentProcessId()) end)
+        if not ok then return end
+        scanState.processId=value
+    end
+    local ok,found,id=pcall(sampGetPlayerIdByCharHandle,PLAYER_PED)
+    local good,ip,port=pcall(sampGetCurrentServerAddress)
+    local nick=pendingSell.localNick()
+    if not ok or not found or not good or not nick or not ip or ip=='' or not port then return end
+    return {process=scanState.processId,player=id,room=tostring(ip)..':'..tostring(port),nick=nick,at=os.time()}
+end
+
+function scanState.sameListingSession(saved)
+    local current=scanState.listingSession()
+    local at=type(saved)=='table' and tonumber(saved.at)
+    return current and at and os.time()-at>=-5 and os.time()-at<=10
+        and saved.process==current.process and saved.player==current.player
+        and saved.room==current.room and saved.nick==current.nick or false
+end
+
 local scanFab = { pollAt = 0, pollBusy = false, cmd = '' }
 
 local function normalizeName(name)
@@ -252,7 +413,8 @@ end
 
 local function parseCashToken(s)
     s = tostring(s or '')
-    local p = s:match(':CASH:(%d[%d%.,%s]*)') or s:match(':DONATE:(%d[%d%.,%s]*)')
+    local p = s:match(':CASHV?:(%d[%d%.,%s]*)') or s:match(':DONATE:(%d[%d%.,%s]*)')
+        or s:match('VC%$(%d[%d%.,%s]*)')
     if p then return cleanPriceNum(p) end
     return cleanPriceNum(s)
 end
@@ -264,6 +426,7 @@ local function dateOffset(daysAgo)
 end
 
 local function ensureCar(name)
+    if scanState.priceSwitchPending then return end
     name = normalizeName(name)
     if name == '' then return nil end
     if not prices[name] then
@@ -289,10 +452,13 @@ local function avgFromDays(days)
     return math.floor(sum / n + 0.5)
 end
 
-local function setDayPrice(name, dateStr, price)
+local function setDayPrice(name, dateStr, price, count)
     name = normalizeName(name)
     dateStr = tostring(dateStr or ''):gsub('^%s+', ''):gsub('%s+$', '')
     price = cleanPriceNum(price)
+    count = tonumber(count)
+    if count and (count ~= count or count < 0 or count >= math.huge) then count=nil end
+    if count then count=math.floor(count) end
     if name == '' or dateStr == '' or not price then return false end
 
     local _, info = ensureCar(name)
@@ -310,12 +476,13 @@ local function setDayPrice(name, dateStr, price)
                 row.price = price
                 changed = true
             end
+            if count and row.count ~= count then row.count=count; changed=true end
             found = true
             break
         end
     end
     if not found then
-        info.days[#info.days + 1] = { date = dateStr, price = price }
+        info.days[#info.days + 1] = { date = dateStr, price = price, count = count }
         changed = true
     end
 
@@ -411,6 +578,7 @@ local function migrateEntry(name, v)
                     days[#days + 1] = {
                         date = tostring(row.date or row.day or row.d or ''),
                         price = tonumber(row.price or row.avg or row.p or 0) or 0,
+                        count = tonumber(row.count or row.sales or row.salesCount),
                     }
                 end
             end
@@ -420,18 +588,55 @@ local function migrateEntry(name, v)
     end
 end
 
-local function loadPrices()
+function scanState.legacyPricesFor(server)
+    if server.vice or not doesFileExist(LEGACY_PRICES_FILE) then return end
+    local claimPath=DATA_DIR..'\\prices-legacy-owner.json'
+    local f=io.open(claimPath,'r')
+    local owner
+    if f then
+        local ok,data=safeDecodeJson(f:read('*a')); f:close()
+        if not ok then return end
+        owner=data.room
+    else
+        if not scanState.writeJsonFile(claimPath,{room=server.room,migrated_at=os.time()}) then return end
+        owner=server.room
+    end
+    if owner==server.room then return LEGACY_PRICES_FILE end
+end
+
+local function loadPrices(server)
+    server=server or scanState.pricesIdentity()
     prices = {}
-    if doesFileExist(DATA_FILE) then
-        local f = io.open(DATA_FILE, 'r')
+    selectedName=nil
+    scanState.pricesDirty=false
+    scanState.priceStore=server
+    DATA_FILE=server and server.path or nil
+    if not DATA_FILE then rebuildList(); return end
+    ensureDir(DATA_DIR..'\\prices')
+    local paths={DATA_FILE,DATA_FILE..'.bak'}
+    local legacy
+    if not doesFileExist(paths[1]) and not doesFileExist(paths[2]) then
+        legacy=scanState.legacyPricesFor(server)
+        if legacy then paths[#paths+1]=legacy end
+    end
+    for _,path in ipairs(paths) do
+        local f = doesFileExist(path) and io.open(path, 'r')
         if f then
             local raw = f:read('*a')
             f:close()
             local ok, data = safeDecodeJson( raw)
-            if ok and type(data) == 'table' then
+            if ok and type(data) == 'table' and (not data.server or data.server==server.room) then
                 local src = data.prices or data
-                for k, v in pairs(src) do
-                    if type(k) == 'string' then migrateEntry(k, v) end
+                if type(src)=='table' then
+                    for k, v in pairs(src) do
+                        if type(k) == 'string' then migrateEntry(k, v) end
+                    end
+                    if path==legacy then
+                        local saved=scanState.writeJsonFile(DATA_FILE,{version=3,server=server.room,prices=prices,saved_at=os.time()})
+                        scanState.pricesDirty=not saved
+                        scanState.saveAt=os.clock()+1
+                    end
+                    break
                 end
             end
         end
@@ -472,12 +677,38 @@ local function cleanupCurrencyNames()
 end
 
 savePrices = function()
+    if not DATA_FILE or not scanState.priceStore then return false end
     ensureDir(DATA_DIR)
-    local f = io.open(DATA_FILE, 'w')
-    if not f then return end
-    f:write(encodeJson({ version = 2, prices = prices, saved_at = os.time() }))
-    f:close()
-    scanState.pricesDirty = false
+    ensureDir(DATA_DIR..'\\prices')
+    local ok,err=scanState.writeJsonFile(DATA_FILE,{version=3,server=scanState.priceStore.room,prices=prices,saved_at=os.time()})
+    if ok then scanState.pricesDirty=false
+    else
+        scanState.saveAt=os.clock()+10
+        print('AutoABarz prices: '..tostring(err or 'ошибка сохранения'))
+    end
+    return ok
+end
+
+function scanState.syncPrices()
+    local server=scanState.pricesIdentity()
+    if not server then
+        scanState.priceSwitchPending=true
+        scanState.active,scanState.wantScan=false,false
+        return false
+    end
+    if scanState.priceStore and scanState.priceStore.room==server.room then
+        scanState.priceSwitchPending=nil
+        return true
+    end
+    scanState.priceSwitchPending=true
+    scanState.active,scanState.wantScan=false,false
+    scanState.scanEpoch=(scanState.scanEpoch or 0)+1
+    if scanState.pricesDirty and not savePrices() then return false end
+    scanState.dlg,scanState.currentName=nil,nil
+    incomingDlg,incomingCef={},{}
+    loadPrices(server)
+    scanState.priceSwitchPending=nil
+    return true
 end
 
 local function mergeImportedCar(name, info)
@@ -506,8 +737,9 @@ local function mergeImportedCar(name, info)
             if date ~= '' and price > 0 then
                 if byDate[date] then
                     byDate[date].price = price
+                    if row.count ~= nil then byDate[date].count=tonumber(row.count) end
                 else
-                    dst.days[#dst.days + 1] = { date = date, price = price }
+                    dst.days[#dst.days + 1] = { date = date, price = price, count=tonumber(row.count) }
                     byDate[date] = dst.days[#dst.days]
                 end
             end
@@ -533,14 +765,15 @@ local function buildShareJson()
                 local date = tostring(row.date or '')
                 local price = tonumber(row.price) or 0
                 if date ~= '' and price > 0 then
-                    days[#days + 1] = { date, price }
+                    days[#days + 1] = { date, price, tonumber(row.count) }
                 end
             end
         end
         pack[name] = { p = tonumber(info.price) or 0, d = days }
         n = n + 1
     end
-    return encodeJson({ abarz = 1, t = os.time(), n = n, p = pack }), n
+    local server=scanState.pricesIdentity()
+    return encodeJson({ abarz = 1, t = os.time(), n = n, p = pack, room=server and server.room }), n
 end
 
 local function importPricesFromText(raw)
@@ -560,6 +793,8 @@ local function importPricesFromText(raw)
     if not ok or type(data) ~= 'table' then
         return 0, 'не получилось прочитать базу'
     end
+    local server=scanState.pricesIdentity()
+    if data.room and (not server or data.room~=server.room) then return 0,'база относится к другому серверу' end
 
     local src = nil
     if tonumber(data.abarz) == 1 and type(data.p) == 'table' then
@@ -574,6 +809,7 @@ local function importPricesFromText(raw)
                             days[#days + 1] = {
                                 date = tostring(pair[1] or pair.date or ''),
                                 price = tonumber(pair[2] or pair.price) or 0,
+                                count = tonumber(pair[3] or pair.count),
                             }
                         end
                     end
@@ -648,6 +884,13 @@ local function saveDealLogs()
                 price = lot.price,
                 at = tonumber(lot.at) or os.time(),
                 source = tostring(lot.source or ''),
+                marketKey=lot.marketKey,marketObjectId=lot.marketObjectId,marketObjectHandle=lot.marketObjectHandle,
+                marketX=lot.marketX,marketY=lot.marketY,marketZ=lot.marketZ,
+                marketTurbo=lot.marketTurbo,marketMileage=lot.marketMileage,
+                marketTurboKnown=lot.marketTurboKnown,
+                marketTuning=lot.marketTuning,
+                marketChatConfirmed=lot.marketChatConfirmed,marketRestoreUntil=lot.marketRestoreUntil,
+                marketVehicleId=lot.marketVehicleId,marketSuppressed=lot.marketSuppressed,
             }
         end
     end
@@ -655,7 +898,8 @@ local function saveDealLogs()
     for _, entry in ipairs(pendingSell.confirmations) do
         if entry.state == 'waiting' or entry.state == 'unresolved' then unresolved[#unresolved+1] = entry end
     end
-    local ok,err=scanState.writeJsonFile(LOGS_FILE,{version=4,deals=dealLogs,listed=listed,unresolved=unresolved,saved_at=os.time()})
+    local ok,err=scanState.writeJsonFile(scanState.dealsPath(),{version=4,deals=dealLogs,listed=listed,unresolved=unresolved,
+        listed_session=scanState.listingSession(),saved_at=os.time()})
     if not ok and not pendingSell.saveErrorNotified then
         chat('Не удалось сохранить сделки: '..tostring(err or 'ошибка записи'), 'error')
     end
@@ -683,11 +927,11 @@ local function dropListedNow(reason)
     return true
 end
 
-local function ingestListedRow(row)
+local function ingestListedRow(row,verifiedSession)
     if type(row) ~= 'table' then return end
     local price = tonumber(row.price) or 0
     local at = tonumber(row.at) or 0
-    if price <= 0 or at <= 0 or (os.time() - at) >= 43200 then return end
+    if price <= 0 or at <= 0 or (not verifiedSession and (os.time() - at) >= 43200) then return end
     pendingSell.lots = pendingSell.lots or {}
     pendingSell.lots[#pendingSell.lots + 1] = {
         id = row.id or pendingSell.newId('lot'),
@@ -696,6 +940,13 @@ local function ingestListedRow(row)
         source = tostring(row.source or 'saved'),
         at = at,
         t = os.clock(),
+        marketKey=row.marketKey,marketObjectId=tonumber(row.marketObjectId),marketObjectHandle=tonumber(row.marketObjectHandle),
+        marketX=tonumber(row.marketX),marketY=tonumber(row.marketY),marketZ=tonumber(row.marketZ),
+        marketTurbo=row.marketTurbo==true or nil,marketMileage=tonumber(row.marketMileage),
+        marketTurboKnown=row.marketTurboKnown==true or row.marketTurbo==true or nil,
+        marketTuning=scanState.marketplace.tuning.clean(row.marketTuning),
+        marketChatConfirmed=row.marketChatConfirmed==true or nil,marketRestoreUntil=tonumber(row.marketRestoreUntil),
+        marketVehicleId=tonumber(row.marketVehicleId),marketSuppressed=row.marketSuppressed==true or nil,
     }
     while #pendingSell.lots > (pendingSell.max or 2) do
         table.remove(pendingSell.lots, 1)
@@ -707,7 +958,8 @@ local function loadDealLogs(keepListed)
     pendingSell.lots = {}
     pendingSell.confirmations = {}
     local data
-    for _,path in ipairs({LOGS_FILE,LOGS_FILE..'.tmp',LOGS_FILE..'.bak'}) do
+    local logsPath = scanState.dealsPath()
+    for _,path in ipairs({logsPath,logsPath..'.tmp',logsPath..'.bak'}) do
         local f=io.open(path,'rb')
         if f then
             local raw=f:read('*a'); f:close()
@@ -716,6 +968,8 @@ local function loadDealLogs(keepListed)
         end
     end
     if not data then return end
+    local sessionRestore=keepListed=='session'
+    if sessionRestore then keepListed=scanState.sameListingSession(data.listed_session) end
     local src = data.deals or data
     if type(src) == 'table' then
         for _, row in ipairs(src) do
@@ -742,20 +996,38 @@ local function loadDealLogs(keepListed)
         local listed = data.listed
         if type(listed) == 'table' then
             if listed[1] then
-                for i = 1, #listed do ingestListedRow(listed[i]) end
+                for i = 1, #listed do ingestListedRow(listed[i],sessionRestore) end
             else
-                ingestListedRow(listed)
+                ingestListedRow(listed,sessionRestore)
+            end
+        end
+        if sessionRestore then
+            for _,lot in ipairs(pendingSell.lots) do
+                lot.marketRestoreUntil=math.min(lot.marketRestoreUntil or math.huge,(tonumber(data.saved_at) or os.time())+300)
+                -- Older builds accumulated chat receipts without a physical car identity.
+                -- Keep them for deal matching, but require fresh evidence to advertise again.
+                if not lot.marketKey and not lot.marketVehicleId then lot.marketSuppressed=true end
+                local id=lot.marketObjectId
+                local handle=id and scanState.mark.objectHandle(id)
+                if handle and type(getObjectModel)=='function' and getObjectModel(handle)==scanState.mark.abModel then
+                    scanState.mark.objectSequence=(scanState.mark.objectSequence or 0)+1
+                    lot.marketObjectGeneration=scanState.mark.objectSequence
+                    scanState.mark.objects[id]={model=scanState.mark.abModel,generation=lot.marketObjectGeneration,
+                        x=lot.marketX,y=lot.marketY,z=lot.marketZ}
+                    if lot.marketObjectHandle==handle then lot.marketRestoreUntil=nil end
+                end
             end
         end
     end
 end
 
-local function fmtMoney(n)
+local function fmtMoney(n,currency)
+    currency = currency or (scanState.isViceCity() and 'VC$' or '$')
     n = math.floor(tonumber(n) or 0)
     local s = tostring(n)
     local left, num, right = s:match('^([^%d]*%d)(%d*)(.-)$')
-    if not left then return '$' .. s end
-    return '$' .. left .. (num:reverse():gsub('(%d%d%d)', '%1.'):reverse()) .. right
+    if not left then return currency .. s end
+    return currency .. left .. (num:reverse():gsub('(%d%d%d)', '%1.'):reverse()) .. right
 end
 
 -- Латинские буквы и похожие кириллические (С/C, О/O, …) в поиске одно и то же.
@@ -829,6 +1101,61 @@ local function normalizeDate(s)
     return s
 end
 
+function scanState.priceHistory(days)
+    local byDate, points = {}, {}
+    for _, row in ipairs(type(days) == 'table' and days or {}) do
+        if type(row) == 'table' then
+            local date = normalizeDate(row.date)
+            local year, month, day = date:match('^(%d%d%d%d)%-(%d%d)%-(%d%d)$')
+            year, month, day = tonumber(year), tonumber(month), tonumber(day)
+            local price = cleanPriceNum(row.price)
+            local limit = month and ({31,28,31,30,31,30,31,31,30,31,30,31})[month]
+            if month == 2 and year and (year%400 == 0 or (year%4 == 0 and year%100 ~= 0)) then limit=29 end
+            if year and year >= 1970 and limit and day >= 1 and day <= limit and price and not byDate[date] then
+                local count=tonumber(row.count)
+                if count and (count ~= count or count<0 or count>=math.huge) then count=nil end
+                local y=year-(month<=2 and 1 or 0)
+                local era=math.floor(y/400)
+                local yoe=y-era*400
+                local doy=math.floor((153*(month+(month>2 and -3 or 9))+2)/5)+day-1
+                local ordinal=era*146097+yoe*365+math.floor(yoe/4)-math.floor(yoe/100)+doy
+                local point = {date=date,price=price,count=count and math.floor(count),ordinal=ordinal}
+                byDate[date]=point
+                points[#points+1]=point
+            end
+        end
+    end
+    table.sort(points,function(a,b) return a.date < b.date end)
+    while #points > MAX_DAYS do table.remove(points,1) end
+    local result={points=points,sales=0,countDays=0}
+    for _, point in ipairs(points) do
+        if point.count ~= nil then result.sales=result.sales+point.count; result.countDays=result.countDays+1 end
+        result.min=math.min(result.min or point.price,point.price)
+        result.max=math.max(result.max or point.price,point.price)
+    end
+    if #points > 0 then
+        result.delta=points[#points].price-points[1].price
+        result.percent=result.delta/points[1].price*100
+    end
+    return result
+end
+
+function scanState.parseDayRow(line)
+    local plain=stripColors(repair_mojibake(ensure_utf8(tostring(line or ''))))
+    plain=plain:gsub('^%s+',''):gsub('%s+$','')
+    local date,rest=plain:match('^(%d%d%d%d%-%d%d%-%d%d)(.*)$')
+    if not date then date,rest=plain:match('^(%d%d[%.%/]%d%d[%.%/]%d%d%d%d)(.*)$') end
+    if not date then return end
+    local count,price=rest:match('^%s*(%d+)%s+(.+)$')
+    if count then
+        price=parseCashToken(price)
+        if price then return normalizeDate(date),tonumber(count),price end
+    end
+    -- Legacy records may contain only the price; an unknown count is not zero.
+    price=parseCashToken(rest:gsub('^%s*[—–|%-]+%s*',''))
+    if price then return normalizeDate(date),nil,price end
+end
+
 local function harvestDaysFromJson(node, carHint, depth)
     depth = depth or 0
     if depth > 12 or type(node) ~= 'table' then return end
@@ -843,11 +1170,11 @@ local function harvestDaysFromJson(node, carHint, depth)
         or node.y or node.sum or node.amount
 
     if name and date and price and looksLikeDate(date) then
-        setDayPrice(name, normalizeDate(date), price)
+        setDayPrice(name, normalizeDate(date), price, node.count or node.sales or node.salesCount)
     elseif name and price and not date then
         setPrice(name, price)
     elseif date and price and looksLikeDate(date) and (carHint or scanState.currentName) then
-        setDayPrice(carHint or scanState.currentName, normalizeDate(date), price)
+        setDayPrice(carHint or scanState.currentName, normalizeDate(date), price, node.count or node.sales or node.salesCount)
     end
 
     -- массив чисел = точки графика за ~30 дней
@@ -899,6 +1226,12 @@ local function regexHarvest(text, carHint)
     if type(text) ~= 'string' then return end
     carHint = carHint or scanState.currentName
     text = repair_mojibake(ensure_utf8(text))
+    if carHint then
+        for line in text:gmatch('[^\r\n]+') do
+            local date,count,price=scanState.parseDayRow(line)
+            if date and price then setDayPrice(carHint,date,price,count) end
+        end
+    end
 
     -- "date":"2026-09-01","price":123
     for date, price in text:gmatch('"date"%s*:%s*"([^"]+)"%s*,%s*"price"%s*:%s*(%d+)') do
@@ -974,6 +1307,10 @@ local function parsePriceLine(line)
     if type(line) ~= 'string' or line == '' then return false end
     line = repair_mojibake(ensure_utf8(line))
     line = line:gsub('{......}', '')
+    local rowDate,rowCount,rowPrice=scanState.parseDayRow(line)
+    if rowDate and scanState.currentName then
+        return setDayPrice(scanState.currentName,rowDate,rowPrice,rowCount)
+    end
 
     local date, price = line:match('^%s*(%d%d[%.%/%-]%d%d[%.%/%-]%d%d%d%d)%s*[—–%-:|]+%s*%$?%s*([%d%s%.,]+)')
     if date and price and scanState.currentName then
@@ -1141,20 +1478,9 @@ local function parseDaysDialog(title, text)
     car = normalizeName(car or '')
     local days = {}
     for line in tostring(text or ''):gmatch('[^\r\n]+') do
-        local plain = stripColors(ensure_utf8(line))
-        local date, cnt, price = plain:match('^(%d%d%d%d%-%d%d%-%d%d)\t(%d+)\t:CASH:(.+)$')
-        if not date then
-            date, cnt, price = plain:match('^(%d%d%d%d%-%d%d%-%d%d)%s+(%d+)%s+:CASH:(.+)$')
-        end
-        if not date then
-            date, price = plain:match('^(%d%d%d%d%-%d%d%-%d%d).-:CASH:(.+)$')
-            cnt = 0
-        end
+        local date, cnt, price = scanState.parseDayRow(line)
         if date and price then
-            local p = parseCashToken(':CASH:' .. tostring(price))
-            if p then
-                days[#days + 1] = { date = date, count = tonumber(cnt) or 0, price = p }
-            end
+            days[#days + 1] = { date = date, count = cnt, price = price }
         end
     end
     return car, days
@@ -1183,7 +1509,7 @@ local function ingestDialog(id, style, title, btn1, btn2, text)
         if car ~= '' then
             scanState.currentName = car
             for _, row in ipairs(days) do
-                setDayPrice(car, row.date, row.price)
+                setDayPrice(car, row.date, row.price, row.count)
             end
         end
     end
@@ -1385,7 +1711,7 @@ local function carHasToday(name)
     if not (info and type(info.days) == 'table') then return false end
     local today = os.date('%Y-%m-%d')
     for i = 1, #info.days do
-        if normalizeDate(info.days[i].date or '') == today then
+        if normalizeDate(info.days[i].date or '') == today and info.days[i].count ~= nil then
             return true
         end
     end
@@ -1397,6 +1723,10 @@ local function requestScan()
 end
 
 local function startScan()
+    if scanState.isViceCity() then
+        chat('На Vice City нет системных средних цен. Найденные лоты доступны во вкладке «Цены».', 'info')
+        return
+    end
     if scanState.active then
         return
     end
@@ -1411,15 +1741,19 @@ local function startScan()
     scanState.index = 0
     scanState.currentName = nil
 
+    scanState.scanEpoch=(scanState.scanEpoch or 0)+1
+    local epoch=scanState.scanEpoch
     lua_thread.create(function()
+        local function current() return scanState.scanEpoch==epoch end
         local page = 0
         local seenFirst = {}
 
-        while scanState.active and page < MAX_PAGES_SAFETY do
+        while current() and scanState.active and page < MAX_PAGES_SAFETY do
             local list = scanState.dlg
             if not list or list.kind ~= 'list' then
                 list = waitForDialog('list', 4000, scanState.dlgSeq or 0)
             end
+            if not current() then return end
             if not list or list.kind ~= 'list' then
                 chat('Нет списка — стоп', 'error')
                 break
@@ -1447,6 +1781,7 @@ local function startScan()
             end
 
             for _, car in ipairs(pageCars) do
+                if not current() then return end
                 if not scanState.active then break end
                 scanState.currentName = car.name
                 if not carHasToday(car.name) then
@@ -1468,6 +1803,7 @@ local function startScan()
                     prevIdx = scanState.dlg.prevIdx or 1
 
                     local daysDlg = openCarDays(listId, car, nextIdx, prevIdx)
+                    if not current() then return end
                     if daysDlg then
                         if not backToList(500) then
                             chat('Назад из дней не сработал. Стоп.', 'error')
@@ -1498,6 +1834,7 @@ local function startScan()
             end
         end
 
+        if not current() then return end
         scanState.active = false
         rebuildList()
         savePrices()
@@ -1639,6 +1976,7 @@ local onNewSalePlate
 local function parseAbbrevPrice(str)
     if not str then return nil end
     local s = tostring(str):gsub('{%x+}', ''):gsub('{......}', ''):gsub('<[^>]+>', '')
+    s = s:gsub(':CASHV?:', ''):gsub('VC%$', '')
     s = s:gsub('[%s%$]', ''):gsub('\160', ''):gsub('\194\160', '')
     -- иконка валюты Arizona (? и т.п.) + «75.000.000»
     local i1, i2, numStr = s:find('(%d[%d%.,]*)')
@@ -1664,6 +2002,7 @@ local function parsePlatePrice(s)
 end
 
 local function lookupAvgPrice(model)
+    if scanState.isViceCity() then return nil end
     local info = prices[normalizeName(model)]
     if not info then return nil end
     local p = tonumber(info.price) or avgFromDays(info.days)
@@ -1709,6 +2048,7 @@ end
 -- Сервер схлопывает варианты в одну среднюю → ищем лучшее совпадение в базе.
 -- Возвращает price, matchedName (имя из prices).
 local function resolveAvgForModel(model)
+    if scanState.isViceCity() then return nil, normalizeName(model) end
     model = normalizeName(model)
     if model == '' then return nil, model end
 
@@ -1818,8 +2158,29 @@ function scanState.mark.validModel(name)
     return name:find('[%a\128-\255]') ~= nil
 end
 
+function scanState.mark.ownerOf(text)
+    local owner = scanState.mark.clean(text):match('Владелец:%s*([^\r\n]+)')
+    if owner then return normalizeName(owner:gsub('^%[%d+%]%s*', '')) end
+end
+
+function scanState.mark.parseVice(text)
+    text = scanState.mark.clean(text)
+    local number, model, amount = text:match('^%s*Автомобиль №(%d+)%s*\n([^\n]+)\n%s*VC%$(%d[%d%.%, ]*)%s*\n')
+    if not number or not scanState.mark.validModel(model) then return nil end
+    local price = cleanPriceNum(amount)
+    local owner = scanState.mark.ownerOf(text)
+    if not price or not owner or owner == '' then return nil end
+    local mileage = text:match('\n%s*(%d[%d%.%, ]*)%s+км%s*\n')
+    return 'sale', normalizeName(model), price, scanState.mark.turboOf(text), {
+        number=tonumber(number), owner=owner, currency='VC$',
+        mileage=mileage and tonumber((mileage:gsub(' ', ''):gsub(',', '.'))),
+        expires=text:match('\n%s*(до [^\n]+)'),
+    }
+end
+
 function scanState.mark.parseShort(text)
     text = scanState.mark.clean(text)
+    if text:match('^%s*Автомобиль №') then return scanState.mark.parseVice(text) end
     local lines = {}
     for line in text:gmatch('[^\n]+') do
         line = line:gsub('^%s+',''):gsub('%s+$','')
@@ -1865,6 +2226,7 @@ end
 local function parseSalePlate(text)
     text = scanState.mark.clean(text)
     if text == '' then return nil end
+    if text:match('^%s*Автомобиль №') then return scanState.mark.parseVice(text) end
 
     local auc = text:match('Аукцион №%d+\n([^\n]+)')
     if auc then
@@ -1928,6 +2290,10 @@ local function vsAvgInfo(lot, avg)
 end
 
 local function notifyNewSale(kind, model, price, turbo)
+    if scanState.isViceCity() and kind == 'sale' then
+        chat(('На продаже: %s за %s'):format(model, fmtMoney(price)))
+        return
+    end
     if kind == 'auction' then
         local msg = ('Новый транспорт на аукционе: %s'):format(model)
         chat(msg)
@@ -2023,7 +2389,8 @@ local function dist3(ax, ay, az, bx, by, bz)
 end
 
 function scanState.mark.inAb()
-    return type(getActiveInterior) == 'function' and getActiveInterior() == scanState.mark.interior
+    local interior = scanState.isViceCity() and 20 or scanState.mark.interior
+    return type(getActiveInterior) == 'function' and getActiveInterior() == interior
 end
 
 function scanState.mark.play()
@@ -2135,6 +2502,7 @@ end
 local function rememberPlate(key, model, price, x, y, z, owner)
     if not key or not model or not price then return end
     knownPlates[key] = {
+        key = key,
         owner = owner,
         model = model,
         price = price,
@@ -2219,6 +2587,24 @@ local function modelsMatchForLot(plateModel, ptsModel)
         return true, 90
     end
     return false, 0
+end
+
+function scanState.viceOffers(filter)
+    local rows, now = {}, os.clock()
+    filter = foldName(filter or '')
+    for _, row in pairs(knownPlates) do
+        local live = row.objectId and scanState.mark.objects[row.objectId]
+        if row.vice and (live or now - (row.t or 0) < 90)
+            and (filter == '' or foldName(row.model .. ' ' .. (row.owner or '')):find(filter,1,true)) then
+            rows[#rows+1] = row
+        end
+    end
+    table.sort(rows,function(a,b)
+        if a.model ~= b.model then return a.model < b.model end
+        if a.price ~= b.price then return a.price < b.price end
+        return (a.vice.number or 0) < (b.vice.number or 0)
+    end)
+    return rows
 end
 
 scanState.findLot = function(model, owner)
@@ -2326,6 +2712,9 @@ function pendingSell.findLot(model, price)
         for _,i in ipairs(matches) do
             if not pendingSell.sameModel(pendingSell.lots[i].model,model) then return nil end
         end
+        for _,i in ipairs(matches) do
+            if not pendingSell.lots[i].marketSuppressed then return i,pendingSell.lots[i] end
+        end
         return matches[1],pendingSell.lots[matches[1]]
     end
 end
@@ -2335,9 +2724,38 @@ function pendingSell.addLot(model, price, source)
     if not price then return false end
     model = normalizeName(model or pendingSell.draftModel or '')
     if isGenericCarName(model) then model = '' end
+    if source=='chat' then
+        local vehicle=scanState.marketplace and scanState.marketplace.currentVehicle()
+        if vehicle then
+            for _,lot in ipairs(pendingSell.lots) do
+                if scanState.marketplace.vehicleIdentity(lot)==tostring(vehicle) and not scanState.marketplace.salePending(lot.id) then
+                    lot.model,lot.price,lot.t,lot.at=pendingSell.preferName(lot.model,model),price,os.clock(),os.time()
+                    lot.marketSuppressed,lot.marketRestoreUntil=nil,nil
+                    lot.marketChatConfirmed=true
+                    lot.marketVehicleId=vehicle
+                    saveDealLogs(); return true
+                end
+            end
+        end
+        local candidate
+        for _,lot in ipairs(pendingSell.lots) do
+            if ((lot.source=='market-plate' and not lot.marketChatConfirmed) or lot.marketNeedsChat) and lot.price==price
+                and os.clock()-(lot.marketChangedAt or lot.t or 0)<10 and pendingSell.sameModel(lot.model,model) then
+                if candidate then candidate=nil; break end
+                candidate=lot
+            end
+        end
+        if candidate then
+            candidate.marketChatConfirmed=true; candidate.marketNeedsChat=nil
+            candidate.marketVehicleId=vehicle or candidate.marketVehicleId
+            candidate.marketSuppressed=nil
+            saveDealLogs(); return true
+        end
+    end
     -- Every server listing confirmation is a new lot, even for equal cars.
     pendingSell.lots[#pendingSell.lots+1] = {id=pendingSell.newId('lot'), model=model,price=price,
-        t=os.clock(),at=os.time(),source=tostring(source or 'chat')}
+        t=os.clock(),at=os.time(),source=tostring(source or 'chat'),
+        marketVehicleId=source=='chat' and scanState.marketplace and scanState.marketplace.currentVehicle() or nil}
     saveDealLogs()
     return true
 end
@@ -2346,6 +2764,7 @@ function pendingSell.removeLot(idx)
     idx = tonumber(idx)
     if not idx or not pendingSell.lots or not pendingSell.lots[idx] then return nil end
     local lot = table.remove(pendingSell.lots, idx)
+    if scanState.marketplace then scanState.marketplace.retire(lot) end
     saveDealLogs()
     return lot
 end
@@ -2460,7 +2879,10 @@ function pendingSell.commit(entry, model, price, source, lotId)
     entry.state,entry.model,entry.price='recorded',model,price
     if scanState.manualConfirmation == entry.id then scanState.manualConfirmation=nil end
     entry.recordedAt=os.clock()
-    if index then table.remove(pendingSell.lots,index) end
+    if index then
+        local removed=table.remove(pendingSell.lots,index)
+        if scanState.marketplace then scanState.marketplace.retire(removed) end
+    end
     addDeal(entry.action,model,price,source,entry.id)
     saveDealLogs()
     return true
@@ -2501,8 +2923,12 @@ function pendingSell.confirmGeneric(action)
         pendingBuy.reset()
     else
         snapshotSellFromPlate()
+        local hasActive=false
+        for _,lot in ipairs(pendingSell.lots) do if not lot.marketSuppressed then hasActive=true; break end end
         for _,lot in ipairs(pendingSell.lots) do
-            entry.candidates[#entry.candidates+1]={id=lot.id,model=lot.model,price=lot.price}
+            if not hasActive or not lot.marketSuppressed then
+                entry.candidates[#entry.candidates+1]={id=lot.id,model=lot.model,price=lot.price}
+            end
         end
     end
     pendingSell.confirmations[#pendingSell.confirmations+1]=entry
@@ -2588,7 +3014,7 @@ local function noteDealDialog(title, text, dialogId)
         local costLine = text:match('Стоимость автомобиля:%s*([^\r\n]+)')
             or text:match('Стоимость транспорта:%s*([^\r\n]+)')
             or text:match('Цена:%s*([^\r\n]+)') or ''
-        local a, b = costLine:match(':CASH:([%d%.,%s]+).-:CASH:([%d%.,%s]+)')
+        local a, b = costLine:match(':CASHV?:([%d%.,%s]+).-:CASHV?:([%d%.,%s]+)')
         if a and b then
             pendingBuy.basePrice,pendingBuy.fee=parsePlatePrice(a),parsePlatePrice(b)
             if pendingBuy.basePrice and pendingBuy.fee then price=pendingBuy.basePrice+pendingBuy.fee end
@@ -2620,6 +3046,16 @@ end
 local function processDealChat(raw)
     local clean = repair_mojibake(stripColors(ensure_utf8(tostring(raw or ''))))
     if clean == '' then return end
+    if scanState.marketplace then
+        local cancellation=clean:gsub('[%.!]+$','')
+        local removed=clean:match('Вы сняли транспорт (.-) с продажи')
+            or clean:match('Вы сняли автомобиль (.-) с продажи')
+        if removed then scanState.marketplace.cancelOwn(removed); return end
+        if cancellation=='Вы сняли транспорт с продажи' or cancellation=='Вы сняли свой транспорт с продажи'
+            or cancellation=='Ваш транспорт был снят с продажи' then
+            scanState.marketplace.cancelOwn(); return
+        end
+    end
 
     local bought_model, bought_price = clean:match('Вы успешно купили транспорт (.-) у игрока .- за %D*(.+)')
     if not bought_model then
@@ -2720,10 +3156,14 @@ onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     if not (x and y and z) and sampId then
         x, y, z = tryObjectPos(sampId)
     end
-    local owner=scanState.mark.clean(text):match('Владелец:%s*([^\n]+)')
-    if owner then owner=normalizeName(owner) end
+    local owner=scanState.mark.ownerOf(text)
     rememberPlate(key, model, price, x, y, z, owner)
     if knownPlates[key] then knownPlates[key].objectId=sampId end
+    local _, _, _, _, vice = scanState.mark.parseVice(text)
+    if vice and knownPlates[key] then knownPlates[key].vice = vice end
+    if kind=='sale' and fromSign and scanState.marketplace then
+        scanState.marketplace.observeOwn(text,model,price,turbo,owner,sampId,x,y,z)
+    end
 
     local own, ownIdx, ownLot = pendingSell.isOwn(model, price, owner)
     if own and ownLot and isGenericCarName(ownLot.model) then
@@ -2970,7 +3410,7 @@ local function passportLotFromText(utf)
                 or plain:match('Стоимость:%s*(.+)$')
             if ps then
                 local p = parsePlatePrice(ps)
-                if p and p >= 1000000 then return p end
+                if p and p > 0 then return p end
             end
         end
     end
@@ -2983,8 +3423,7 @@ local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     local utf = ensure_utf8(text)
     if utf:find('Средняя цена:', 1, true) or utf:find('Дешевле средней', 1, true) then return end
     local model = parsePassportModel(text)
-    local owner = stripColors(utf):match('Владелец:%s*([^\r\n]+)')
-    if owner then owner=normalizeName(owner) end
+    local owner = scanState.mark.ownerOf(utf)
     local avg, avgName = nil, nil
     if model then avg, avgName = resolveAvgForModel(model) end
     -- приоритет: табличка рядом → текст ПТС (цена продажи)
@@ -2992,7 +3431,7 @@ local function queuePassportDialogPatch(id, style, title, btn1, btn2, text)
     if (not lot or lot <= 0) then
         lot = passportLotFromText(utf)
     end
-    local avgLabel = avg and fmtMoney(avg) or 'нет в базе'
+    local avgLabel = avg and fmtMoney(avg) or (scanState.isViceCity() and 'нет системных средних цен на Vice City' or 'нет в базе')
     if avg and avgName and model and foldName(avgName) ~= foldName(model) then
         avgLabel = ('%s (%s)'):format(avgLabel, avgName)
     end
@@ -3050,6 +3489,7 @@ local function injectPassportPrice(model)
     end
     if lot <= 0 then lot = 0 end
     local avgLine = avg and ('Средняя: %s'):format(fmtMoney(avg)) or 'Средняя: нет в базе'
+    if scanState.isViceCity() then avgLine = 'Vice City: системные средние цены отсутствуют' end
     if avg and avgName and model and foldName(avgName) ~= foldName(model) then
         avgLine = ('Средняя: %s (%s)'):format(fmtMoney(avg), avgName)
     end
@@ -3131,7 +3571,7 @@ local function noteVehiclePassport(packet)
     if not looksLikeVehicleDoc(doc, event, text) then return end
     local model = carNameFromNode(doc)
     local owner = type(doc)=='table' and (doc.ownerName or doc.owner) or nil
-    if type(owner)~='string' then owner=nil else owner=normalizeName(owner) end
+    if type(owner)~='string' then owner=nil else owner=normalizeName(owner:gsub('^%[%d+%]%s*','')) end
     if not model then
         model = parsePassportModel(text)
     end
@@ -3156,6 +3596,7 @@ end
 
 local function ingestAbCefPacket(packet)
     if not packet then return end
+    scanState.marketplace.tuning.cef(packet)
     local jsonText0 = tostring(packet.jsonText or '')
     local evName = tostring(packet.event or '')
     local rawText = tostring(packet.text or '')
@@ -3194,6 +3635,12 @@ local function queueCefSnap(packet)
         snap.json = packet.json
     end
     local utf = ensure_utf8(text)
+    if snap.event=='event.inventory.playerInventory' or snap.event=='event.inventory.updateCharacterTab'
+        or snap.event=='event.inventory.setPlayerInventoryVisible' or snap.event=='event.setActiveView' then
+        incomingCef[#incomingCef+1]=snap
+        if #incomingCef>256 then table.remove(incomingCef,1) end
+        return
+    end
     if snap.event:find('inventory',1,true) or snap.event:find('storage',1,true) then return end
     if utf:find('playerInventory',1,true) or utf:find('event.storage',1,true) then return end
     if not (isAbCefText(utf,snap.event) or snap.event:find('dialog',1,true)
@@ -3238,6 +3685,8 @@ local function onAnyDialog(id, style, title, btn1, btn2, text)
     local finger = table.concat({tostring(id),tostring(style),tostring(title),tostring(text)}, '\1')
     if finger == lastDlgFinger then return end
     lastDlgFinger = finger
+    scanState.marketplace.tuning.saleDialog(id,text or '',finger)
+    scanState.marketplace.tuning.dialog(title or '',text or '')
     scanState.currentDialog = {id=tonumber(id), kind=kind, finger=finger}
     if kind == 'other' then
         scanState.dlg = nil
@@ -3290,7 +3739,11 @@ if ok_ev and ev then
             if pendingBuy.dialogId == id then pendingBuy.reset() end
             if pendingSell.draftDialogId == id then pendingSell.draftModel=''; pendingSell.draftAt=nil end
         end
-        if prevResponse then return prevResponse(id,button,listitem,input) end
+        if prevResponse then
+            local result=prevResponse(id,button,listitem,input)
+            if result~=nil then return result end
+        end
+        return scanState.marketplace.tuning.saleResponse(id,button,listitem,input)
     end
     local prevDlg = ev.onShowDialog
     function ev.onShowDialog(id, style, title, btn1, btn2, text)
@@ -3314,6 +3767,7 @@ if ok_ev and ev then
     local prevCreate = ev.onCreateObject
     function ev.onCreateObject(id, data)
         if type(data)=='table' then
+            if scanState.marketplace then scanState.marketplace.retired[id]=nil end
             local pos=data.position or {}
             scanState.mark.objectSequence=(scanState.mark.objectSequence or 0)+1
             scanState.mark.objects[id]={generation=scanState.mark.objectSequence,model=tonumber(data.modelId),x=tonumber(pos.x),y=tonumber(pos.y),z=tonumber(pos.z)}
@@ -3329,6 +3783,7 @@ if ok_ev and ev then
     end
     local prevDestroy = ev.onDestroyObject
     function ev.onDestroyObject(id)
+        if scanState.marketplace then pcall(scanState.marketplace.noteSignGone,id) end
         scanState.mark.objects[id]=nil
         scanState.mark.pendingShort[id]=nil
         PLATES['obj_'..tostring(id)]=nil
@@ -3354,6 +3809,11 @@ if ok_ev and ev then
                 v = data.text
             elseif type(data) == 'string' then
                 v = data
+            end
+            if scanState.marketplace and type(data)=='table' and data.materialId==1 and type(v)=='string' then
+                local object=scanState.mark.objects[id]
+                scanState.marketplace.pendingClears[id]=v:match('^%s*$') and object and {generation=object.generation} or nil
+                if not v:match('^%s*$') then scanState.marketplace.retired[id]=nil end
             end
             if type(v) == 'string' and v ~= '' then
                 queuePlate({
@@ -3385,6 +3845,7 @@ if ok_ev and ev then
 
     local prevLost = ev.onConnectionLost
     function ev.onConnectionLost()
+        if scanState.marketplace then pcall(scanState.marketplace.close) end
         pendingBuy.reset()
         scanState.mark.objects = {}
         knownPlates, PLATES, incomingPlates = {}, {}, {}
@@ -3394,6 +3855,7 @@ if ok_ev and ev then
     end
     local prevClosed = ev.onConnectionClosed
     function ev.onConnectionClosed()
+        if scanState.marketplace then pcall(scanState.marketplace.close) end
         pendingBuy.reset()
         scanState.mark.objects = {}
         knownPlates, PLATES, incomingPlates = {}, {}, {}
@@ -3453,19 +3915,10 @@ local function drainHttpCbQueue()
     scanState.httpDraining = false
 end
 
-local function jsonEsc(s)
-    s = tostring(s or '')
-        :gsub('\\', '\\\\')
-        :gsub('"', '\\"')
-        :gsub('\r', '')
-        :gsub('\n', ' ')
-        :gsub('\t', ' ')
-    return s
-end
-
 local function ensureChatCid()
     if chatState.cid ~= '' then return chatState.cid end
-    chatState.cid = ('%s-%d-%d'):format(
+    chatState.cid = ('%s-%s-%d-%d'):format(
+        pendingSell.localNick() or 'unknown',
         tostring(os.time()),
         math.random(1000, 9999),
         math.floor((os.clock() % 1) * 1e6)
@@ -3496,7 +3949,7 @@ local function pushScriptChat(nick, text, isSelf, shareUrl)
     text = tostring(text or '')
     if text == '' then return end
     if not shareUrl or shareUrl == '' then
-        shareUrl = tostring(text):match('(https://ntfy%.sh/file/[%w%._%-]+)')
+        shareUrl = scanState.cloud.shareUrl(text)
     end
     chatLines[#chatLines + 1] = {
         time = os.date('%H:%M:%S'),
@@ -3518,6 +3971,15 @@ end
 -- Важно: из effil нельзя возвращать table с именованными ключами — только примитивы / array.
 local function httpRequestAsync(method, url, body, headers, callback, timeout)
     callback = callback or function() end
+    if scanState.cloud then
+        local topic,suffix=tostring(url):match('^https://abarz%.internal/([^/]+)(.*)$')
+        if topic and (topic:match('^abarz%-market%-v1%-') or topic:match('^abarzv161%-')) then
+            if not scanState.cloud.url then queueHttpCb(callback,nil,'ABarz API не настроен',0); return end
+            scanState.cloud.request(method,topic,suffix,body,callback,timeout)
+            return
+        end
+        if tostring(url):find('^https?://ntfy%.sh/') then queueHttpCb(callback,nil,'Старые ссылки ntfy больше не поддерживаются',0); return end
+    end
     if not ok_effil then
         queueHttpCb(callback, nil, 'нет сети', 0)
         return
@@ -3557,6 +4019,7 @@ local function httpRequestAsync(method, url, body, headers, callback, timeout)
                 one, c, rh = https_m.request({
                     url = u,
                     method = m,
+                    redirect = false,
                     headers = hdrs,
                     source = (#b > 0) and ltn12_m.source.string(b) or nil,
                     sink = ltn12_m.sink.table(chunks),
@@ -3574,9 +4037,11 @@ local function httpRequestAsync(method, url, body, headers, callback, timeout)
                             loc = origin .. loc
                         end
                         u = loc
-                        m = 'GET'
-                        b = ''
-                        hdrs['Content-Length'] = nil
+                        -- 307/308 (and PUT redirects) must retain the publication body.
+                        if c==303 and m~='HEAD' then
+                            m,b='GET',''
+                            hdrs['Content-Length']=nil
+                        end
                     else
                         break
                     end
@@ -3620,6 +4085,7 @@ local function httpRequestAsync(method, url, body, headers, callback, timeout)
     end
     jobs[#jobs + 1] = {
         th = th,
+        url = tostring(url),
         cb = callback,
         untilAt = os.clock() + timeout + 8,
     }
@@ -3665,6 +4131,9 @@ scanState.pumpHttpJobs = function()
         end
         if done then
             code = tonumber(code) or 0
+            if not (okFlag==true or okFlag==1) then
+                scanState.lastHttpError=tostring(payload or 'error'):sub(1,160)..' ['..tostring(code)..']'
+            end
             if okFlag == true or okFlag == 1 then
                 queueHttpCb(job.cb, tostring(payload or ''), nil, code > 0 and code or 200)
             else
@@ -3680,6 +4149,147 @@ end
 ---------------------------------------------------------------------------
 -- Картинки машин (База) — всё через carImg.*, без новых local
 ---------------------------------------------------------------------------
+scanState.cloud={defaultUrl='https://abarz-api.andergr0ynd-59c.workers.dev',queue={},active=0,generation=0,nextRegister=0}
+
+function scanState.cloud.validUrl(url)
+    return type(url)=='string' and url:match('^https://[%w%.%-]+$') and not url:find('%.%.')
+end
+
+function scanState.cloud.shareUrl(text)
+    local url=tostring(text or ''):match('(https://[%w%.%-]+/v1/prices/[a-f0-9%-]+)')
+    local base=scanState.cloud.url or scanState.cloud.defaultUrl
+    if url and base and url:sub(1,#base+11)==base..'/v1/prices/' and #url==#base+11+36 then return url end
+    return nil
+end
+
+function scanState.cloud.error(err,code)
+    local ok,data=safeDecodeJson(tostring(err or ''))
+    local detail=ok and data.error or tostring(err or 'Нет ответа')
+    return 'ABarz API: '..tostring(detail)..' ['..tostring(code or 0)..']'
+end
+
+function scanState.cloud.load()
+    local c=scanState.cloud
+    local url=c.defaultUrl
+    local f=io.open(DATA_DIR..'\\cloudflare.json','r')
+    if f then
+        local ok,data=safeDecodeJson(f:read('*a')); f:close()
+        if ok and type(data.apiUrl)=='string' then url=data.apiUrl:gsub('/+$','') end
+    end
+    c.url=c.validUrl(url) and url or nil
+    c.device=nil
+    c.generation=c.generation+1
+    c.queue,c.active,c.nextRegister,c.registering,c.nextPollAt={},0,0,false,0
+    if not c.url then return end
+    f=io.open(DATA_DIR..'\\cloudflare-device.json','r')
+    if f then
+        local ok,data=safeDecodeJson(f:read('*a')); f:close()
+        if ok and data.apiUrl==c.url and type(data.token)=='string' and #data.token==64
+            and data.token:match('^[a-f0-9]+$') and type(data.deviceId)=='string' then c.device=data end
+    end
+end
+
+function scanState.cloud.request(method,topic,suffix,body,callback,timeout)
+    local c=scanState.cloud
+    if method~='GET' and method~='PUT' then queueHttpCb(callback,nil,'ABarz API: неподдерживаемый запрос',0); return end
+    if #c.queue>=128 then queueHttpCb(callback,nil,'ABarz API: очередь переполнена',0); return end
+    c.queue[#c.queue+1]={method=method,topic=topic,body=body or '',callback=callback,
+        since=tostring(suffix):match('[?&]since=([%w_%-]+)'),untilAt=os.clock()+(tonumber(timeout) or 12)+20}
+    c.pollReadyAt=c.pollReadyAt or (os.clock()+0.1)
+end
+
+function scanState.cloud.uploadPrices(topic,payload,nick,callback)
+    local c=scanState.cloud
+    if not c.url then queueHttpCb(callback,nil,'ABarz API не настроен',0); return end
+    if #c.queue>=128 then queueHttpCb(callback,nil,'ABarz API: очередь переполнена',0); return end
+    c.queue[#c.queue+1]={method='SHARE',topic=topic,body=payload,nick=nick,callback=callback,untilAt=os.clock()+80}
+end
+
+function scanState.cloud.register()
+    local c=scanState.cloud
+    if c.registering or os.time()<c.nextRegister then return end
+    c.registering=true
+    local generation=c.generation
+    httpRequestAsync('POST',c.url..'/v1/register','{}',{['Content-Type']='application/json'},function(body,err,code)
+        if generation~=c.generation then return end
+        c.registering=false
+        local ok,data=safeDecodeJson(body or '')
+        if err or not ok or type(data.deviceId)~='string' or type(data.token)~='string'
+            or #data.token~=64 or not data.token:match('^[a-f0-9]+$') then
+            c.errorText=c.error(err or body,code)
+            c.nextRegister=os.time()+60
+            return
+        end
+        local device={apiUrl=c.url,deviceId=data.deviceId,token=data.token}
+        if not scanState.writeJsonFile(DATA_DIR..'\\cloudflare-device.json',device) then
+            c.errorText='Не удалось сохранить ключ ABarz API'
+            c.nextRegister=os.time()+60; return
+        end
+        c.device,c.errorText=device,nil
+    end,12)
+end
+
+function scanState.cloud.send(path,data,callback)
+    local c=scanState.cloud
+    local generation=c.generation
+    c.active=c.active+1
+    httpRequestAsync('POST',c.url..path,encodeJson(data),{
+        ['Content-Type']='application/json',['Authorization']='Bearer '..c.device.token,
+        ['User-Agent']='ABarz/1.9'},function(body,err,code)
+        if generation~=c.generation then return end
+        c.active=math.max(0,c.active-1)
+        if err then c.errorText=c.error(err,code) else c.errorText=nil end
+        if tonumber(code)==401 then
+            c.device=nil; c.nextRegister=os.time()+10
+            scanState.writeJsonFile(DATA_DIR..'\\cloudflare-device.json',{})
+        end
+        callback(body,err and c.errorText or nil,code)
+    end,12)
+end
+
+function scanState.cloud.pump()
+    local c=scanState.cloud
+    if not c.url then return end
+    local waiting={}
+    for _,job in ipairs(c.queue) do
+        if os.clock()>job.untilAt then queueHttpCb(job.callback,nil,c.errorText or 'ABarz API: timeout',0)
+        else waiting[#waiting+1]=job end
+    end
+    c.queue=waiting
+    if #c.queue==0 then c.pollReadyAt=nil; return end
+    if not c.device then c.register(); return end
+    while c.active<3 do
+        local index
+        for i,job in ipairs(c.queue) do if job.method=='PUT' or job.method=='SHARE' then index=i; break end end
+        if not index then break end
+        local job=table.remove(c.queue,index)
+        local share=job.method=='SHARE'
+        c.send(share and '/v1/prices' or '/v1/publish',share and {topic=job.topic,payload=job.body,nick=job.nick} or {topic=job.topic,message=job.body},function(body,err,code)
+            queueHttpCb(job.callback,body,err,code)
+        end)
+    end
+    if c.active>=3 or os.clock()<(c.pollReadyAt or 0) or os.time()<(c.nextPollAt or 0) then return end
+    local topics,jobs,remaining={},{},{}
+    for _,job in ipairs(c.queue) do
+        if job.method=='GET' and #topics<2 then
+            topics[#topics+1]={topic=job.topic,since=job.since or '1h'}; jobs[#jobs+1]=job
+        else remaining[#remaining+1]=job end
+    end
+    c.queue=remaining
+    c.pollReadyAt=os.clock()+0.1
+    if #topics==0 then return end
+    c.nextPollAt=os.time()+30
+    c.send('/v1/poll',{topics=topics},function(body,err,code)
+        local ok,data=safeDecodeJson(body or '')
+        for index,job in ipairs(jobs) do
+            local stream=ok and type(data.streams)=='table' and data.streams[index]
+            if err or not stream or stream.topic~=job.topic or type(stream.body)~='string' then
+                queueHttpCb(job.callback,nil,err or 'ABarz API: некорректный ответ каталога',code)
+            else queueHttpCb(job.callback,stream.body,nil,200) end
+        end
+    end)
+end
+
 function carImg.safeKey(name)
     name = normalizeName(name):lower()
     name = name:gsub('[^%w%+%-%._]+', '_')
@@ -3687,16 +4297,6 @@ function carImg.safeKey(name)
     if name == '' then name = 'car' end
     if #name > 80 then name = name:sub(1, 80) end
     return name
-end
-
-function carImg.localPath(name)
-    local key = carImg.safeKey(name)
-    local exts = { '.jpg', '.jpeg', '.png', '.bmp' }
-    for i = 1, #exts do
-        local p = carImg.dir .. '\\' .. key .. exts[i]
-        if doesFileExist(p) then return p end
-    end
-    return carImg.dir .. '\\' .. key .. '.jpg'
 end
 
 function carImg.releaseSlot(slot)
@@ -3722,33 +4322,30 @@ function carImg.normKey(s)
 end
 
 function carImg.ingestVehiclesJson(raw)
-    raw = tostring(raw or '')
-    if raw == '' then return 0 end
-    local n = 0
-    for block in raw:gmatch('%b{}') do
-        local name = block:match('"name"%s*:%s*"([^"]+)"')
-        local mid = tonumber(block:match('"model_id"%s*:%s*(%d+)'))
-        local sid = tonumber(block:match('"server_id"%s*:%s*(%d+)'))
-        -- картинки на CDN чаще по server_id; model_id — запасной
-        local imgId = sid or mid
-        if name and imgId and imgId > 0 then
-            name = normalizeName(name)
-            carImg.byName[name:lower()] = {
-                name = name,
-                model_id = mid or imgId,
-                server_id = sid or imgId,
-                img_id = imgId,
-                key = carImg.normKey(name),
-            }
-            n = n + 1
+    local ok,rows=safeDecodeJson(raw)
+    if not ok or type(rows)~='table' then return 0 end
+    local mapped,n={},0
+    for _,source in ipairs(rows) do
+        if type(source)=='table' then
+            local name=normalizeName(source.name or '')
+            local sid,mid=tonumber(source.server_id),tonumber(source.model_id)
+            if name~='' and sid and sid>0 and sid==math.floor(sid) then
+                local key=name:lower()
+                local previous=mapped[key]
+                mapped[key]={name=name,model_id=mid,server_id=sid,img_id=sid,key=carImg.normKey(name),
+                    ambiguous=previous and (previous.ambiguous or previous.server_id~=sid) or false}
+                n=n+1
+            end
         end
     end
+    if n>0 then carImg.byName=mapped end
     return n
 end
 
 function carImg.loadVehiclesMap(force)
     if carImg.mapLoading then return end
-    if carImg.mapReady and not force then return end
+    if carImg.mapAttempted and not force then return end
+    carImg.mapAttempted=true
     carImg.mapLoading = true
     if doesFileExist(carImg.mapFile) and not force then
         local f = io.open(carImg.mapFile, 'r')
@@ -3757,15 +4354,13 @@ function carImg.loadVehiclesMap(force)
             f:close()
             if carImg.ingestVehiclesJson(raw) > 0 then
                 carImg.mapReady = true
-                carImg.mapLoading = false
-                return
             end
         end
     end
     httpRequestAsync('GET',
         'https://api.arztools.tech/tools/arizona/vehicles.json',
         '',
-        { ['User-Agent'] = 'AutoABarz', ['Accept'] = 'application/json' },
+        { ['User-Agent'] = 'Mozilla/5.0 (compatible; AutoABarz)', ['Accept'] = 'application/json' },
         function(body, err)
             carImg.mapLoading = false
             body = tostring(body or '')
@@ -3782,46 +4377,22 @@ end
 
 -- Возвращает img_id (для CDN), отобрамое имя, model_id
 function carImg.resolveModelId(model)
-    model = normalizeName(model)
-    if model == '' then return nil, nil, nil end
-    local hit = carImg.byName[model:lower()]
-    if hit then return hit.img_id, hit.name, hit.model_id end
-
-    local q = carImg.normKey(model)
-    for _, cand in ipairs(avgNameCandidates(model)) do
-        hit = carImg.byName[cand:lower()]
-        if hit then return hit.img_id, hit.name, hit.model_id end
-        local cq = carImg.normKey(cand)
-        for _, row in pairs(carImg.byName) do
-            if row.key == cq then
-                return row.img_id, row.name, row.model_id
-            end
+    model=normalizeName(model)
+    if model=='' then return end
+    local hit=carImg.byName[model:lower()]
+    if hit then
+        if not hit.ambiguous then return hit.img_id,hit.name,hit.model_id end
+        return
+    end
+    -- Only harmless brand spelling aliases; never discard trim/chassis words.
+    local key,best=carImg.normKey(model),nil
+    for _,row in pairs(carImg.byName) do
+        if row.key==key then
+            if row.ambiguous or (best and best.img_id~=row.img_id) then return end
+            best=row
         end
     end
-
-    -- префикс / вхождение после нормализации (Mercedes S600 → … S600 W140)
-    local best, bestScore
-    for _, row in pairs(carImg.byName) do
-        local k = row.key or ''
-        if k == q then
-            return row.img_id, row.name, row.model_id
-        end
-        local score
-        if k:sub(1, #q + 1) == q .. ' ' then
-            score = 500 - (#k - #q) -- короче хвост — лучше для «S600» без кузова
-        elseif q:sub(1, #k + 1) == k .. ' ' then
-            score = 400
-        elseif k:find(q, 1, true) then
-            score = 300 - (#k - #q)
-        elseif q:find(k, 1, true) and #k >= 5 then
-            score = 200
-        end
-        if score and (not bestScore or score > bestScore) then
-            best, bestScore = row, score
-        end
-    end
-    if best then return best.img_id, best.name, best.model_id end
-    return nil, nil, nil
+    if best then return best.img_id,best.name,best.model_id end
 end
 
 function carImg.cdnUrl(imgId, mirror)
@@ -3833,96 +4404,25 @@ function carImg.cdnUrl(imgId, mirror)
 end
 
 function carImg.cachePathById(imgId)
-    return carImg.dir .. '\\' .. tostring(imgId) .. '.png'
+    return carImg.officialDir .. '\\' .. tostring(imgId) .. '.png'
 end
 
-function carImg.tryCdn(name, imgId, mirror, triedMid)
-    imgId = tonumber(imgId)
-    mirror = tonumber(mirror) or 1
-    local slot = carImg.ensureSlot(name)
-    if not imgId then
-        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
-        return
-    end
-    local dest = carImg.cachePathById(imgId)
+function carImg.tryCdn(name,imgId,mirror)
+    imgId,mirror=tonumber(imgId),tonumber(mirror) or 1
+    local slot=carImg.ensureSlot(name)
+    if not imgId then slot.status='fail'; slot.msg='Точная модель не найдена'; return end
+    local dest=carImg.cachePathById(imgId)
     if doesFileExist(dest) then
         carImg.releaseSlot(slot)
-        slot.path = dest
-        slot.status = 'ready'
-        slot.msg = ''
-        slot.img_id = imgId
+        slot.path,slot.status,slot.msg,slot.img_id=dest,'ready','',imgId
         return
     end
-    local url = carImg.cdnUrl(imgId, mirror)
-    if not url then
-        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
-        return
+    slot.status,slot.msg,slot.img_id='loading','Загрузка фото Arizona…',imgId
+    carImg.dlFail=function()
+        if mirror<#carImg.cdn then carImg.tryCdn(name,imgId,mirror+1); return end
+        slot.status,slot.msg='fail','Фото этой модели пока недоступно'
     end
-    slot.status = 'loading'
-    slot.msg = 'CDN Arizona…'
-    slot.img_id = imgId
-    carImg.dlFail = function()
-        if mirror < #carImg.cdn then
-            carImg.tryCdn(name, imgId, mirror + 1, triedMid)
-            return
-        end
-        local mid = tonumber(slot.model_id)
-        if mid and mid ~= imgId and not triedMid then
-            carImg.tryCdn(name, mid, 1, true)
-            return
-        end
-        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
-    end
-    carImg.startFileDownload(name, url, dest)
-end
-
-function carImg.wikiTitles(model)
-    local out, seen = {}, {}
-    local function push(s)
-        s = normalizeName(s)
-        if s == '' then return end
-        s = s:gsub('%s+', '_')
-        if seen[s] then return end
-        seen[s] = true
-        out[#out + 1] = s
-    end
-    for _, cand in ipairs(avgNameCandidates(model)) do
-        push(cand)
-        push(cand:gsub('^Mercedes%s+', 'Mercedes-Benz '))
-        local base, ch = cand:match('^(.+)%s+([WwEe]%d%d%d?)$')
-        if base and ch then
-            ch = ch:upper()
-            push(base .. ' (' .. ch .. ')')
-            push((base:gsub('^Mercedes%s+', 'Mercedes-Benz ')) .. ' (' .. ch .. ')')
-            if base:lower():find('s%d%d%d', 1) or base:lower():find('s%-?class', 1) then
-                push('Mercedes-Benz S-Class (' .. ch .. ')')
-            end
-            if base:lower():find('x5', 1, true) then
-                push('BMW X5 (' .. ch .. ')')
-            end
-            if base:lower():find('m5', 1, true) then
-                push('BMW M5 (' .. ch .. ')')
-            end
-        end
-    end
-    return out
-end
-
-function carImg.parseWikiThumb(json)
-    json = tostring(json or '')
-    local url = json:match('"thumbnail"%s*:%s*%b{}')
-    if url then url = url:match('"source"%s*:%s*"(.-)"') end
-    if not url then
-        url = json:match('"originalimage"%s*:%s*%b{}')
-        if url then url = url:match('"source"%s*:%s*"(.-)"') end
-    end
-    if not url or url == '' then return nil end
-    url = url:gsub('\\/', '/'):gsub('\\u0026', '&'):gsub('%?.*$', '')
-    if not url:find('^https?://') then return nil end
-    if not (url:lower():find('%.jpe?g') or url:lower():find('%.png') or url:lower():find('%.bmp')) then
-        if not url:find('upload%.wikimedia%.org', 1) then return nil end
-    end
-    return url
+    carImg.startFileDownload(name,carImg.cdnUrl(imgId,mirror),dest)
 end
 
 function carImg.onDownloadFail(name)
@@ -3945,11 +4445,6 @@ function carImg.startFileDownload(name, url, dest)
             ['Accept'] = 'image/png,image/*,*/*',
         }, function(body, err)
             local slot = carImg.ensureSlot(name)
-            if carImg.activeName ~= name and carImg.dlFail then
-                -- устаревшая закачка
-                carImg.dl = nil
-                return
-            end
             if err or type(body) ~= 'string' or #body < 800 then
                 carImg.onDownloadFail(name)
                 return
@@ -4000,44 +4495,16 @@ function carImg.startFileDownload(name, url, dest)
     end)
 end
 
-function carImg.tryWiki(name, titles, idx)
-    idx = tonumber(idx) or 1
-    carImg.dlFail = nil
-    local slot = carImg.ensureSlot(name)
-    if idx > #titles then
-        slot.status = 'fail'
-        slot.msg = 'нет на CDN'
-        return
-    end
-    slot.status = 'loading'
-    slot.msg = 'поиск…'
-    local title = titles[idx]
-    local url = 'https://en.wikipedia.org/api/rest_v1/page/summary/' .. title
-    httpRequestAsync('GET', url, '', {
-        ['User-Agent'] = 'AutoABarz/car-preview (moonloader)',
-        ['Accept'] = 'application/json',
-    }, function(body, err)
-        if carImg.activeName ~= name then return end
-        local thumb = (not err) and carImg.parseWikiThumb(body) or nil
-        if not thumb then
-            carImg.tryWiki(name, titles, idx + 1)
-            return
-        end
-        slot.msg = 'скачиваю…'
-        local dest = carImg.localPath(name)
-        if not dest:lower():match('%.jpe?g$') then
-            dest = carImg.dir .. '\\' .. carImg.safeKey(name) .. '.jpg'
-        end
-        carImg.startFileDownload(name, thumb, dest)
-    end, 15)
-end
-
 function carImg.request(name)
     name = normalizeName(name)
     if name == '' then return end
     carImg.activeName = name
-    carImg.loadVehiclesMap(false)
     local slot = carImg.ensureSlot(name)
+    if carImg.dl and carImg.dl.name~=name then
+        carImg.pending=name
+        return
+    end
+    carImg.loadVehiclesMap(false)
 
     if slot.tex and slot.status == 'ok' then return end
     if slot.status == 'loading' or slot.status == 'ready' then return end
@@ -4046,6 +4513,19 @@ function carImg.request(name)
     slot.img_id = imgId
     slot.model_id = mid
     slot.matched = matched
+
+    -- ручной файл по имени
+    local key = carImg.safeKey(name)
+    for _, ext in ipairs({ '.jpg', '.jpeg', '.png', '.bmp' }) do
+        local p = carImg.customDir .. '\\' .. key .. ext
+        if doesFileExist(p) then
+            carImg.releaseSlot(slot)
+            slot.path = p
+            slot.status = 'ready'
+            slot.msg = ''
+            return
+        end
+    end
 
     -- кэш по id с CDN
     if imgId then
@@ -4059,39 +4539,25 @@ function carImg.request(name)
         end
     end
 
-    -- ручной файл по имени
-    local key = carImg.safeKey(name)
-    for _, ext in ipairs({ '.jpg', '.jpeg', '.png', '.bmp' }) do
-        local p = carImg.dir .. '\\' .. key .. ext
-        if doesFileExist(p) then
-            carImg.releaseSlot(slot)
-            slot.path = p
-            slot.status = 'ready'
-            slot.msg = ''
-            return
-        end
-    end
-
     if not imgId then
-        if carImg.mapLoading or not carImg.mapReady then
+        if carImg.mapLoading then
             slot.status = 'loading'
             slot.msg = 'карта машин…'
             carImg.pending = name
             return
         end
-        slot.status = 'loading'
-        slot.msg = 'загрузка…'
-        carImg.tryWiki(name, carImg.wikiTitles(name), 1)
+        slot.status = 'fail'
+        slot.msg = 'Точная модель не найдена'
         return
     end
 
     slot.status = 'loading'
     slot.msg = 'CDN Arizona…'
-    carImg.tryCdn(name, imgId, 1, false)
+    carImg.tryCdn(name, imgId, 1)
 end
 
 function carImg.pump()
-    if carImg.pending and carImg.mapReady then
+    if carImg.pending and not carImg.dl and (carImg.mapReady or not carImg.mapLoading) then
         local n = carImg.pending
         carImg.pending = nil
         local slot = carImg.slots[n]
@@ -4151,7 +4617,7 @@ function carImg.pump()
     end
 end
 
-function carImg.drawPreview(name, maxW, scale)
+function carImg.drawPreview(name, maxW, scale, compact, thumbnail)
     scale = scale or 1
     name = normalizeName(name)
     if name == '' then return end
@@ -4171,6 +4637,7 @@ function carImg.drawPreview(name, maxW, scale)
         imgui.Image(slot.tex, imgui.ImVec2(maxW, h))
     else
         imgui.BeginChild('##carprev', imgui.ImVec2(maxW, h), true)
+        imgui.SetWindowFontScale(scale)
         local msg = slot.msg
         if slot.status == 'loading' then
             msg = msg ~= '' and msg or 'загрузка…'
@@ -4179,10 +4646,13 @@ function carImg.drawPreview(name, maxW, scale)
         else
             msg = 'превью…'
         end
+        if compact then msg = slot.status == 'fail' and 'Фото недоступно' or 'Загрузка фото…' end
+        if thumbnail then msg = slot.status == 'fail' and 'Нет фото' or 'Загрузка…' end
         imgui.SetCursorPos(imgui.ImVec2(12 * scale, h / 2 - 8 * scale))
         imgui.TextDisabled(msg)
         imgui.EndChild()
     end
+    if compact then return end
     if slot.img_id then
         imgui.TextDisabled(('CDN id  %d'):format(slot.img_id))
     elseif slot.model_id then
@@ -4190,7 +4660,19 @@ function carImg.drawPreview(name, maxW, scale)
     end
 end
 
--- Автообновление через effil (как ntfy/share). downloadUrlToFile + wait() в колбэке крашит lua51.dll.
+function carImg.drawThumbnail(name,width,scale)
+    carImg.drawPreview(name,width*scale,scale,true,true)
+    local slot=carImg.slots[normalizeName(name)]
+    if slot and slot.tex and slot.status=='ok' and imgui.IsItemHovered() then
+        imgui.BeginTooltip()
+        imgui.SetWindowFontScale(scale)
+        imgui.Text(normalizeName(name))
+        imgui.Image(slot.tex,imgui.ImVec2(240*scale,math.floor(240*0.62)*scale))
+        imgui.EndTooltip()
+    end
+end
+
+-- Автообновление через effil. downloadUrlToFile + wait() в колбэке крашит lua51.dll.
 local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/version.json'
 local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/autoabarz.lua'
 
@@ -4328,10 +4810,7 @@ end
 
 local function resolveShareFetchUrl(raw)
     raw = tostring(raw or ''):gsub('^%s+', ''):gsub('%s+$', '')
-    if raw:match('^https?://') then
-        return raw
-    end
-    return nil
+    return scanState.cloud.shareUrl(raw)
 end
 
 local function extractShareUrl(res)
@@ -4375,7 +4854,7 @@ local function resolveArizonaServer()
     pcall(function()
         ip, port = sampGetCurrentServerAddress()
     end)
-    ip = tostring(ip or '')
+    ip = scanState.canonicalServerHost(ip)
     port = tonumber(port) or 0
     local key = ip .. ':' .. tostring(port)
     local offline = (ip == '' or ip == '0.0.0.0' or port == 0)
@@ -4388,7 +4867,9 @@ local function resolveArizonaServer()
     end
 
     local special = CHAT_BY_IP[ip]
-    if not special and normChatName(name):find('vicecity', 1, true) then
+    local known=false
+    for _,server in ipairs(scanState.servers) do if server[3]==ip then known=true; break end end
+    if not special and not known and normChatName(name):find('vicecity', 1, true) then
         special = { label = 'Vice City', topic = 'abarzv161-qk7-hvc1' }
     end
     if special then
@@ -4397,12 +4878,9 @@ local function resolveArizonaServer()
 
     local num = parseServerNumFromName(name)
     local label = name ~= '' and name or (ip .. ':' .. tostring(port))
-    if not num then
-        local host = (ip .. '_' .. tostring(port)):gsub('[^%w]', '')
-        if host == '' then host = 'unknown' end
-        return nil, label, 'abarzv161-qk7-h' .. host
-    end
-    return num, label, ('abarzv161-qk7-s%d'):format(num)
+    local host = (ip .. '_' .. tostring(port)):gsub('[^%w]', '')
+    if host == '' then host = 'unknown' end
+    return num, label, 'abarzv161-qk7-h' .. host
 end
 
 local function refreshChatRoom()
@@ -4414,7 +4892,7 @@ local function refreshChatRoom()
         ip, port = sampGetCurrentServerAddress()
     end)
     if tostring(ip or '') == '' or ip == '0.0.0.0' or (tonumber(port) or 0) == 0 then return nil end
-    chatState.serverKey = tostring(ip or '') .. ':' .. tostring(tonumber(port) or 0)
+    chatState.serverKey = scanState.canonicalServerHost(ip) .. ':' .. tostring(tonumber(port) or 0)
     chatState.serverNum = num
     chatState.serverName = label
     chatState.topic = topic
@@ -4491,8 +4969,9 @@ local function ingestNtfyLine(line)
     local shareUrl = ''
     local att = obj.attachment
     if type(att) == 'table' and att.url then
-        shareUrl = tostring(att.url)
+        shareUrl = scanState.cloud.shareUrl(att.url) or ''
     end
+    if okPayload and type(payload)=='table' then shareUrl=scanState.cloud.shareUrl(payload.shareUrl) or shareUrl end
     if mid == '' then
         if not obj.time then return end
         local fp = tostring(obj.time)..'|'..cid..'|'..msg..'|'..shareUrl
@@ -4540,7 +5019,7 @@ local function onPollResult(body, err, code, request)
         return
     end
     -- успех — мягко возвращаем интервал к 12с
-    chatState.pollMs = 12000
+    chatState.pollMs = (scanState.cloud and scanState.cloud.url) and 30000 or 12000
     chatState.status = 'онлайн'
     for line in body:gmatch('[^\r\n]+') do
         ingestNtfyLine(line)
@@ -4552,13 +5031,9 @@ local function chatPollOnce()
     local topic = refreshChatRoom()
     if chatState.inFlight then return end
     if not topic or topic == '' then return end
-    local url = 'https://ntfy.sh/' .. topic .. '/json?poll=1'
-    if chatState.sinceId and chatState.sinceId ~= '' then
-        url = url .. '&since=' .. tostring(chatState.sinceId)
-    else
-        -- без since ntfy отдаёт ВЕСЬ кэш топика — при открытии это дублирует историю
-        url = url .. '&since=30m'
-    end
+    local since=chatState.sinceId
+    if type(since)~='string' or not since:match('^[%w_%-]+$') then since='1h' end
+    local url = 'https://abarz.internal/' .. topic .. '/json?poll=1&since='..since
     chatState.requestSeq = chatState.requestSeq + 1
     local request = {generation=chatState.generation,topic=topic,serverKey=chatState.serverKey,token=chatState.requestSeq}
     chatState.inFlight = true
@@ -4567,6 +5042,24 @@ local function chatPollOnce()
         ['User-Agent'] = 'ABarz/1.6',
         ['Accept'] = 'application/x-ndjson',
     }, function(body,err,code) onPollResult(body,err,code,request) end)
+end
+
+function scanState.verifyNtfyAck(body,topic,payload)
+    local ok,ack=safeDecodeJson(body)
+    if not ok or ack.event~='message' or ack.topic~=topic or type(ack.id)~='string'
+        or ack.id=='' or ack.message~=payload then return false end
+    return true
+end
+
+function scanState.publicationError(err,code)
+    if tonumber(code)==429 then
+        local detail=tostring(err or '')
+        if detail:find('42908',1,true) or detail:find('daily message quota',1,true) then
+            return 'Дневной лимит сервиса исчерпан (429). Новые лоты и сообщения пока не отправляются.'
+        end
+        return 'Сервис временно ограничил отправку (429). Повторю позже.'
+    end
+    return tostring(err or code or '?')
 end
 
 local function chatSendHttp(nick, text, onDone, messageId)
@@ -4578,10 +5071,16 @@ local function chatSendHttp(nick, text, onDone, messageId)
         messageId = cid..':'..tostring(chatState.sendSeq)
     end
     local payload = encodeJson({v=2,cid=cid,nick=nick,text=text,messageId=messageId})
-    httpRequestAsync('PUT','https://ntfy.sh/'..topic,payload,{
+    httpRequestAsync('PUT','https://abarz.internal/'..topic,payload,{
         ['User-Agent']='ABarz/1.7.2', ['Content-Type']='text/plain; charset=utf-8',
         ['Title']=chatState.truncate(nick,64),
-    },function(body,err,code) if onDone then onDone(err,code) end end)
+    },function(body,err,code)
+        if tonumber(code)==429 then err=scanState.publicationError(err or body,code) end
+        if not err and not scanState.verifyNtfyAck(body,topic,payload) then
+            err='Сервис не подтвердил отправку сообщения'
+        end
+        if onDone then onDone(err,code) end
+    end)
 end
 
 function chatState.sendRow(row)
@@ -4608,7 +5107,7 @@ local function startChatPoller()
     chatState.pollerToken = chatState.pollerToken + 1
     local token = chatState.pollerToken
     chatState.polling = true
-    chatState.pollMs = 12000
+    chatState.pollMs = (scanState.cloud and scanState.cloud.url) and 30000 or 12000
     chatState.inFlight = false
     lua_thread.create(function()
         ensureChatCid()
@@ -4647,10 +5146,10 @@ end
 local function setChatEnabled(on)
     chatOn[0] = on and true or false
     if chatOn[0] then
-        -- не сбрасываем seen/sinceId: иначе при открытии ntfy снова отдаёт
+        -- не сбрасываем seen/sinceId: иначе при открытии API снова отдаёт
         -- те же сообщения, и они накладываются на уже показанные
         chatState.status = 'подключение...'
-        chatState.pollMs = 12000
+        chatState.pollMs = (scanState.cloud and scanState.cloud.url) and 30000 or 12000
         startChatPoller()
         if chatOn[0] then
         end
@@ -4661,6 +5160,7 @@ local function setChatEnabled(on)
         chatState.inFlightToken = nil
         chatState.status = 'выкл'
     end
+    if scanState.saveSettings then scanState.saveSettings() end
 end
 
 local function sendScriptChat(raw)
@@ -4686,7 +5186,12 @@ local function sendScriptChat(raw)
 end
 
 local function startSharePrices()
+    if scanState.isViceCity() then
+        chat('На Vice City нет базы системных средних цен для обмена.', 'info')
+        return
+    end
     if shareState.busy then return end
+    if not scanState.syncPrices() then chat('Не удалось открыть базу текущего сервера.','warning'); return end
     if not next(prices) then
         shareState.msg = 'база пустая'
         chat('Нечем делиться — сначала скан или скачай чужую базу', 'warning')
@@ -4707,12 +5212,9 @@ local function startSharePrices()
     end
     shareState.busy = true
     shareState.msg = 'загрузка...'
+    local shareRoom=chatState.serverKey
     local nick = tostring(myNickname() or 'ABarz'):gsub('[\r\n]', ''):sub(1, 64)
-    httpRequestAsync('PUT', 'https://ntfy.sh/' .. topic, payload, {
-        ['User-Agent'] = 'ABarz/1.6',
-        ['Filename'] = 'abarz.json',
-        ['Title'] = nick ~= '' and nick or 'ABarz',
-    }, function(res, err, code)
+    scanState.cloud.uploadPrices(topic,payload,nick,function(res, err, code)
         shareState.busy = false
         local url = ''
         local ok, obj = safeDecodeJson( tostring(res or ''))
@@ -4722,7 +5224,9 @@ local function startSharePrices()
         if url == '' then
             url = extractShareUrl(res) or ''
         end
-        if url:find('ntfy.sh/file', 1, true) then
+        if not err and scanState.cloud.shareUrl(url) then
+            if ok and obj.id then rememberChatId(tostring(obj.id)) end
+            if shareRoom~=chatState.serverKey then shareState.msg='база отправлена на прежний сервер'; return end
             shareState.lastUrl = url
             shareState.msg = 'в чате'
             copyShareUrl(url)
@@ -4743,10 +5247,14 @@ local function startSharePrices()
         else
             chat('Не удалось поделиться базой', 'error')
         end
-    end, 60)
+    end)
 end
 
 local function startDownloadPrices(raw)
+    if scanState.isViceCity() then
+        chat('База средних цен Arizona не применяется к Vice City.', 'warning')
+        return
+    end
     if shareState.busy then return end
     raw = tostring(raw or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if raw == '' then
@@ -4762,6 +5270,7 @@ local function startDownloadPrices(raw)
     end
     shareState.busy = true
     shareState.msg = 'скачивание...'
+    local downloadRoom=scanState.pricesIdentity()
     httpRequestAsync('GET', url, '', {
         ['User-Agent'] = 'ABarz/1.6',
         ['Accept'] = 'application/json, text/plain, */*',
@@ -4777,6 +5286,11 @@ local function startDownloadPrices(raw)
             end
             return
         end
+        local currentRoom=scanState.pricesIdentity()
+        if not downloadRoom or not currentRoom or downloadRoom.room~=currentRoom.room then
+            shareState.msg='сервер изменился'; chat('Скачивание базы отменено: сервер изменился.','warning'); return
+        end
+        if not scanState.syncPrices() then shareState.msg='база сервера недоступна'; return end
         local added, ierr = importPricesFromText(res)
         if ierr then
             shareState.msg = ierr
@@ -4791,6 +5305,997 @@ end
 ---------------------------------------------------------------------------
 -- UI  (во вложенной функции: в чанке Lua 5.1 максимум 200 local)
 ---------------------------------------------------------------------------
+scanState.marketplace = {
+    enabled=true, sharing=true, ttl=300, heartbeat=180, peers={}, generation=0, sequence=0,
+    nextSend=0, nextPoll=0, status='Ожидание подключения', visibleAt=0,pendingClears={},retired={},
+    selectedServer=0,viewGeneration=0,
+}
+
+function scanState.marketplace.serverLabel(index)
+    local server=scanState.servers[index]
+    if not server then return 'Текущий сервер' end
+    return index==33 and server[1] or ('#%02d · %s'):format(server[4] or index,server[1])
+end
+
+function scanState.marketplace.serverOrder()
+    local order={33,0}
+    for index=1,#scanState.servers do if index~=33 then order[#order+1]=index end end
+    return order
+end
+
+function scanState.marketplace.roomLabel(room)
+    for index,server in ipairs(scanState.servers) do
+        if room==server[3]..':7777' then return scanState.marketplace.serverLabel(index) end
+    end
+    return room or 'Нет подключения'
+end
+
+function scanState.marketplace.bindView()
+    local m=scanState.marketplace
+    local server=scanState.servers[m.selectedServer]
+    local target=m.ctx
+    if server and (not m.ctx or m.ctx.room~=server[3]..':7777') then
+        target={room=server[3]..':7777',key='browse:'..server[3]..':7777',
+            topic='abarz-market-v1-'..(server[3]..'-7777'):gsub('[^%w%-]','_'),
+            currency=m.selectedServer==33 and 'VC$' or '$'}
+    end
+    if (m.viewCtx and m.viewCtx.key)~=(target and target.key) then
+        m.viewGeneration=m.viewGeneration+1
+        m.peers,m.cursor={},nil
+        m.pollBusy,m.nextPoll,m.pollBlockedUntil=false,0,0
+        m.status=target and 'Подключение к каталогу' or 'Ожидание подключения'
+        m.viewCtx=target
+    end
+    return m.viewCtx
+end
+
+function scanState.marketplace.selectServer(index)
+    local m=scanState.marketplace
+    index=tonumber(index)
+    if not index or index~=math.floor(index) or index<0 or index>#scanState.servers then return false end
+    m.selectedServer=index
+    m.bindView()
+    return true
+end
+
+function scanState.marketplace.currentVehicle()
+    if type(isCharInAnyCar)~='function' or type(storeCarCharIsInNoSave)~='function'
+        or type(sampGetVehicleIdByCarHandle)~='function' then return end
+    local ok,id=pcall(function()
+        if not isCharInAnyCar(PLAYER_PED) then return end
+        local found,value=sampGetVehicleIdByCarHandle(storeCarCharIsInNoSave(PLAYER_PED))
+        if found and type(value)=='number' and value>0 and value<2000 then return value end
+    end)
+    if ok then return id end
+end
+
+scanState.marketplace.tuning={cache={},attempted={},types={[12]='v',[23]='t',[18]='n',[19]='p',[36]='n'}}
+
+scanState.marketplace.tuning.itemNames={
+    ["1031"]="Шашка такси (черный-1) [деталь тюнинга]",
+    ["1129"]="Улучшение для автомобиля",
+    ["2320"]="Сертификат Toyota Supra A90",
+    ["2321"]="Сертификат UAZ",
+    ["2322"]="Сертификат Volvo XC90 2012",
+    ["2323"]="Талон снятия предупреждений",
+    ["2324"]="Коленвал (improv)",
+    ["2325"]="Коленвал (sport)",
+    ["2326"]="Коленвал (sport+)",
+    ["2327"]="Распредвал (improv)",
+    ["2328"]="Распредвал (sport)",
+    ["2329"]="Распредвал (sport+)",
+    ["2330"]="Турбокомпрессор (improv)",
+    ["2331"]="Турбокомпрессор (sport)",
+    ["2332"]="Турбокомпрессор (sport+)",
+    ["2333"]="Нагнетатель (improv)",
+    ["2334"]="Нагнетатель (sport)",
+    ["2335"]="Нагнетатель (sport+)",
+    ["2336"]="Чип-тюнинг (STAGE 1)",
+    ["2337"]="Чип-тюнинг (STAGE 2)",
+    ["2338"]="Чип-тюнинг (STAGE 3)",
+    ["2339"]="Сцепление (improv)",
+    ["2340"]="Сцепление (sport)",
+    ["2341"]="Сцепление (sport+)",
+    ["2342"]="КПП (improv)",
+    ["2343"]="КПП (sport)",
+    ["2344"]="КПП (sport+)",
+    ["2345"]="Дифференциал (improv)",
+    ["2346"]="Дифференциал (sport)",
+    ["2347"]="Дифференциал (sport+)",
+    ["2348"]="Подвеска (improv)",
+    ["2349"]="Подвеска (sport)",
+    ["2350"]="Подвеска (sport+)",
+    ["2351"]="Тормоза (improv)",
+    ["2352"]="Тормоза (sport)",
+    ["2353"]="Тормоза (sport+)",
+    ["2354"]="Винил-1",
+    ["2355"]="Винил-2",
+    ["2356"]="Винил-3",
+    ["2357"]="Винил-4",
+    ["2358"]="Винил-5",
+    ["2359"]="Винил-6",
+    ["4817"]="Увеличенный бак (160 литров)",
+    ["6516"]="Красное Нитро",
+    ["9701"]="Диски (Пряня 2k26)",
+    ["10123"]="Багажник Double-Gang",
+    ["10276"]="Ковш: Mad Donut",
+    ["10321"]="Номерная рамка: Rubio",
+    ["10368"]="Номер на Т/С",
+    ["10838"]="Протекающие радиоактивные бочки",
+    ["10839"]="Гроб на крышу",
+    ["10842"]="Адский нагнетатель",
+    ["10856"]="Ухмыляющийся полумесяц",
+}
+
+function scanState.marketplace.tuning.itemName(id)
+    local t=scanState.marketplace.tuning
+    if not t.namesLoaded then
+        t.namesLoaded=true
+        for _,version in ipairs({35,34,33,0}) do
+            local f=io.open(getWorkingDirectory()..'\\ArzMarket\\items_data'..version..'.json','r')
+            if f then
+                local raw=f:read(2000001); f:close()
+                local ok,names=safeDecodeJson(raw)
+                if ok and type(names)=='table' then t.names=names; break end
+            end
+        end
+    end
+    return t.names and t.names[tostring(id)] or t.itemNames[tostring(id)] or ('Деталь #'..tostring(id))
+end
+
+function scanState.marketplace.tuning.clean(data)
+    if type(data)~='table' then return end
+    local result,count={},0
+    for _,key in ipairs({'v','t','p','m','n'}) do
+        if data[key]~=nil then
+            if type(data[key])~='table' or #data[key]>64 then return end
+            result[key]={}
+            for _,name in ipairs(data[key]) do
+                if type(name)~='string' or #name>180 or name:find('[%c]') then return end
+                count=count+1; if count>64 then return end
+                result[key][#result[key]+1]=name
+            end
+        end
+    end
+    if next(result)==nil then return end
+    return result
+end
+
+function scanState.marketplace.tuning.store(id,model,data)
+    local m=scanState.marketplace
+    local ctx=m.context()
+    data=m.tuning.clean(data)
+    if not ctx or not data or not id or not scanState.mark.validModel(model) then return false end
+    local snapshot={id=id,model=model,data=data,at=m.now(),room=ctx.room,handle=m.tuning.handle(id)}
+    m.tuning.cache[ctx.room..'/'..id]=snapshot
+    if m.tuning.sale and m.tuning.sale.phase=='reading' and m.tuning.sale.vehicle==id and m.tuning.sale.room==ctx.room then
+        m.tuning.sale.received=true
+    end
+    for _,lot in ipairs(pendingSell.lots) do
+        if m.vehicleIdentity(lot)==tostring(id) and pendingSell.sameModel(lot.model,model) then lot.marketTuning=data end
+    end
+    m.tuning.pending=nil
+    saveDealLogs()
+    return true
+end
+
+function scanState.marketplace.tuning.handle(id)
+    if type(sampGetCarHandleBySampVehicleId)~='function' then return end
+    local ok,found,handle=pcall(sampGetCarHandleBySampVehicleId,id)
+    if ok and found then return handle end
+end
+
+function scanState.marketplace.tuning.available()
+    return ok_arz and arz and type(arz.eval)=='function'
+end
+
+function scanState.marketplace.tuning.eval(js)
+    if not scanState.marketplace.tuning.available() then return false end
+    return pcall(arz.eval,js,0)
+end
+
+function scanState.marketplace.tuning.saleDialog(id,text,finger)
+    local t=scanState.marketplace.tuning
+    local m=scanState.marketplace
+    local clean=scanState.mark.clean(text)
+    if tonumber(id)==8905 and clean:find('Вы хотите выставить свой транспорт на продажу за',1,true) then
+        local ctx=m.context()
+        local vehicle=m.currentVehicle()
+        if ctx and vehicle then
+            t.confirm={id=tonumber(id),finger=finger,context=ctx.key,room=ctx.room,vehicle=vehicle,handle=t.handle(vehicle)}
+            return
+        end
+    end
+    t.confirm=nil
+    if t.sale then t.sale.interrupted=true end
+end
+
+function scanState.marketplace.tuning.saleResponse(id,button,listitem,input)
+    local t=scanState.marketplace.tuning
+    if t.replaying then return end
+    if tonumber(button)~=1 then
+        if t.sale and tonumber(id)==t.sale.id then t.sale.interrupted=true end
+        return
+    end
+    if t.sale and tonumber(id)==t.sale.id then return false end
+    local confirm=t.confirm
+    if not confirm or tonumber(id)~=confirm.id or not t.available() then return end
+    local ctx=scanState.marketplace.context()
+    if not ctx or ctx.key~=confirm.context or scanState.marketplace.currentVehicle()~=confirm.vehicle then return end
+    t.sale={id=confirm.id,button=button,listitem=listitem,input=input or '',finger=confirm.finger,
+        context=confirm.context,room=confirm.room,vehicle=confirm.vehicle,handle=confirm.handle,phase='queued'}
+    return false
+end
+
+function scanState.marketplace.tuning.finishSale(resume,reason)
+    local t=scanState.marketplace.tuning
+    local sale=t.sale
+    if not sale then return end
+    t.sale,t.pending,t.confirm=nil,nil,nil
+    local ctx=scanState.marketplace.context()
+    if sale.opened and ctx and ctx.key==sale.context then
+        t.eval("window.executeEvent('event.inventory.setPlayerInventoryVisible','[false]');window.executeEvent('event.setActiveView','[null]');if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('onActiveViewChanged|null',0);}")
+        t.inventoryVisible=false
+    end
+    if not resume then
+        if reason then chat(reason,'warning') end
+        return
+    end
+    t.replaying=true
+    local sent,err=pcall(sampSendDialogResponse,sale.id,sale.button,sale.listitem,sale.input)
+    t.replaying=false
+    if not sent then chat('Не удалось продолжить выставление: '..tostring(err),'error')
+    elseif not sale.received then chat('Тюнинг не получен. Продолжаю выставление машины.','warning') end
+end
+
+function scanState.marketplace.tuning.pumpSale()
+    local m=scanState.marketplace
+    local t=m.tuning
+    local sale=t.sale
+    if not sale then return false end
+    local ctx=m.context()
+    local dialog=scanState.currentDialog
+    if sale.interrupted or not ctx or ctx.key~=sale.context or m.currentVehicle()~=sale.vehicle
+        or (sale.handle and sale.handle~=t.handle(sale.vehicle))
+        or not dialog or dialog.id~=sale.id or dialog.finger~=sale.finger then
+        t.finishSale(false,'Считывание тюнинга отменено: машина или окно изменились. Выставьте транспорт заново.')
+        return true
+    end
+    if sale.phase=='queued' then
+        sale.phase,sale.started,sale.deadline='opening',m.now(),m.now()+8
+        t.attempted[sale.room..'/'..sale.vehicle]=true
+        sale.opened=not t.inventoryVisible
+        t.stage=nil
+        t.pending={id=sale.vehicle,at=m.now()}
+        chat('Считываю тюнинг машины перед выставлением…')
+        if sale.opened then
+            local sent=type(sampSendChat)=='function' and pcall(sampSendChat,'/invent')
+            if not sent then t.finishSale(true); return true end
+        end
+    end
+    if sale.received or m.now()>=sale.deadline then
+        t.finishSale(true)
+    elseif sale.phase=='opening' and t.inventoryVisible and (not sale.opened or m.now()-sale.started>=1) then
+        sale.phase='reading'
+        t.stage=nil
+        local sent=t.eval("if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('requestShowingInventory|30',0);}")
+        if not sent then t.finishSale(true) end
+    end
+    return true
+end
+
+function scanState.marketplace.tuning.dialog(title,text)
+    title=scanState.mark.clean(title)
+    text=scanState.mark.clean(text)
+    if not text:find('Технический тюнинг',1,true) or not text:find('Визуальный тюнинг',1,true) then return false end
+    local model,id=title:match('^(.-)%s*%[ID:%s*(%d+)%]$')
+    if not model then return false end
+    local groups={['Визуальный тюнинг']='v',['Технический тюнинг']='t',['Винил']='p',['Модификация']='m',['Номерной знак']='n'}
+    local data,key={},nil
+    for line in text:gmatch('[^\r\n]+') do
+        line=line:gsub('^%s+',''):gsub('%s+$','')
+        if groups[line] then key=groups[line]; data[key]={}
+        elseif key then
+            local name=line:match('^%[%d+%]%s*(.-)\t') or line:match('^%[%d+%]%s*(.+)$')
+            if name and name~='' then data[key][#data[key]+1]=name end
+        end
+    end
+    return scanState.marketplace.tuning.store(tonumber(id),normalizeName(model),data)
+end
+
+function scanState.marketplace.tuning.cef(packet)
+    local m=scanState.marketplace
+    local t=m.tuning
+    if packet.event=='event.inventory.setPlayerInventoryVisible' or packet.event=='event.setActiveView' then
+        local doc=packet.json
+        if type(doc)~='table' then local ok; ok,doc=safeDecodeJson(packet.jsonText or ''); if not ok then return end end
+        if packet.event=='event.setActiveView' then
+            if doc[1]=='Inventory' then t.inventoryVisible=true
+            elseif doc[1]==nil or tostring(doc[1])=='null' then t.inventoryVisible=false end
+        elseif type(doc[1])=='boolean' then t.inventoryVisible=doc[1] end
+        return
+    end
+    if t.sale and t.sale.phase=='opening' then return end
+    local id=m.currentVehicle()
+    local ctx=m.context()
+    if not id or not ctx then t.stage=nil; return end
+    local doc=packet.json
+    if type(doc)~='table' then local ok; ok,doc=safeDecodeJson(packet.jsonText or ''); if not ok then return end end
+    local event=packet.event or ''
+    if event=='event.inventory.updateCharacterTab' then
+        local stage=t.stage
+        if doc[1]=='vehicle' and stage and stage.id==id and stage.room==ctx.room and m.now()-stage.at<=10
+            and stage.model and stage.data.t and stage.data.v then
+            t.store(id,stage.model,stage.data); t.stage=nil
+        end
+        return
+    end
+    if event~='event.inventory.playerInventory' then return end
+    for _,entry in ipairs(doc) do
+        local data=type(entry)=='table' and entry.data
+        if type(data)=='table' then
+            local group=t.types[tonumber(data.type)]
+            if group and entry.action==0 and type(data.items)=='table' then
+                if not t.stage or t.stage.id~=id or t.stage.room~=ctx.room or m.now()-t.stage.at>10 then
+                    t.stage={id=id,room=ctx.room,at=m.now(),data={},parts={}}
+                end
+                local list={}
+                for _,item in ipairs(data.items) do
+                    if type(item)=='table' and tonumber(item.item) and tonumber(item.item)>0 then
+                        list[#list+1]=t.itemName(tonumber(item.item))
+                    end
+                end
+                t.stage.parts[tonumber(data.type)]=list
+                local merged={}
+                for _,kind in ipairs({12,23,18,19,36}) do
+                    if t.types[kind]==group then
+                        for _,name in ipairs(t.stage.parts[kind] or {}) do merged[#merged+1]=name end
+                    end
+                end
+                t.stage.data[group]=merged
+            elseif entry.action==1 and type(data.name)=='string' and t.stage and t.stage.id==id and t.stage.room==ctx.room then
+                t.stage.model=normalizeName(data.name)
+            end
+        end
+    end
+end
+
+function scanState.marketplace.tuning.pump(forceId)
+    local m=scanState.marketplace
+    local t=m.tuning
+    forceId=forceId or t.force
+    t.force=nil
+    local ctx=m.ctx
+    if t.pumpSale() then return end
+    if not ctx then t.stage,t.pending=nil,nil; return end
+    local canRequest=not scanState.active and not scanState.wantScan
+        and not (type(sampIsDialogActive)=='function' and sampIsDialogActive())
+    for _,lot in ipairs(pendingSell.lots) do
+        local id=m.vehicleIdentity(lot)
+        local cached=id and t.cache[ctx.room..'/'..id]
+        if cached and m.now()-cached.at<900 and pendingSell.sameModel(cached.model,lot.model)
+            and (not cached.handle or cached.handle==t.handle(tonumber(id))) then lot.marketTuning=cached.data end
+        if canRequest and id and not lot.marketSuppressed and not lot.marketTuning and m.currentVehicle()==tonumber(id)
+            and (not t.attempted[ctx.room..'/'..id] or forceId==id) and ok_arz and arz and arz.eval then
+            t.attempted[ctx.room..'/'..id]=true
+            t.pending={id=tonumber(id),at=m.now()}
+            pcall(arz.eval,"if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('requestShowingInventory|30',0);}",0)
+            break
+        end
+    end
+    if t.pending and m.now()-t.pending.at>12 then t.pending=nil end
+end
+
+function scanState.marketplace.vehicleIdentity(lot)
+    local id=tonumber(lot.marketVehicleId) or tonumber(tostring(lot.marketKey or ''):match('^vehicle:(%d+)$'))
+    if id and id>0 and id==math.floor(id) then return tostring(id) end
+end
+
+function scanState.marketplace.reconcileIdentities()
+    local m,seen,changed=scanState.marketplace,{},false
+    local i=1
+    while i<=#pendingSell.lots do
+        local lot=pendingSell.lots[i]
+        local identity=m.vehicleIdentity(lot)
+        local keep=identity and seen[identity]
+        if keep and not m.salePending(keep.id) and not m.salePending(lot.id) then
+            if (lot.at or 0)>=(keep.at or 0) then
+                keep.model,keep.price,keep.at,keep.t=lot.model,lot.price,lot.at,lot.t
+                keep.marketSuppressed=lot.marketSuppressed
+            end
+            for _,field in ipairs({'marketKey','marketObjectId','marketObjectGeneration','marketObjectHandle',
+                'marketX','marketY','marketZ','marketObservedAt','marketVehicleId','marketChatConfirmed',
+                'marketTurbo','marketTurboKnown','marketMileage','marketTuning'}) do
+                if keep[field]==nil then keep[field]=lot[field] end
+            end
+            keep.marketVehicleId=tonumber(identity)
+            for _,entry in ipairs(pendingSell.confirmations) do
+                local choices,ids={},{}
+                for _,choice in ipairs(entry.candidates or {}) do
+                    if choice.id==lot.id then choice.id=keep.id end
+                    if not ids[choice.id] then choices[#choices+1]=choice; ids[choice.id]=true end
+                end
+                entry.candidates=choices
+            end
+            table.remove(pendingSell.lots,i)
+            changed=true
+        else
+            if identity then seen[identity]=lot end
+            i=i+1
+        end
+    end
+    if changed then saveDealLogs() end
+end
+
+function scanState.marketplace.retire(lot)
+    if not lot then return end
+    local m=scanState.marketplace
+    if lot.marketObjectId and lot.marketObjectGeneration then
+        m.retired[lot.marketObjectId]=lot.marketObjectGeneration
+    end
+end
+
+function scanState.marketplace.now() return os.time() end
+function scanState.marketplace.request(...)
+    return httpRequestAsync(...)
+end
+
+function scanState.marketplace.context()
+    if not pendingSell.inWorld() or type(sampGetCurrentServerAddress)~='function' then return end
+    local ok,ip,port=pcall(sampGetCurrentServerAddress)
+    local nick=pendingSell.localNick()
+    ip,port=scanState.canonicalServerHost(ip),tonumber(port)
+    if not ok or ip=='' or ip=='0.0.0.0' or not port or port<=0 or not nick or nick=='' then return end
+    local room=ip..':'..port
+    return {room=room,nick=nick,key=room..'/'..nick,
+        topic='abarz-market-v1-'..(ip..'-'..port):gsub('[^%w%-]','_'),
+        currency=scanState.isViceCity() and 'VC$' or '$'}
+end
+
+function scanState.marketplace.collect()
+    local m=scanState.marketplace
+    local blocked,rows={},{}
+    for _,entry in ipairs(pendingSell.confirmations) do
+        if entry.action=='sell' and (entry.state=='waiting' or entry.state=='unresolved') then
+            for _,candidate in ipairs(entry.candidates or {}) do blocked[candidate.id]=true end
+        end
+    end
+    for _,lot in ipairs(pendingSell.lots) do
+        local price=cleanPriceNum(lot.price)
+        if not blocked[lot.id] and not lot.marketSuppressed and (not lot.marketRestoreUntil or lot.marketRestoreUntil>m.now())
+            and price and not isGenericCarName(lot.model)
+            and scanState.mark.validModel(lot.model)
+            and (lot.source=='chat' or lot.source=='plate' or lot.source=='market-plate') then
+            local mileage=tonumber(lot.marketMileage)
+            if mileage and (mileage~=mileage or mileage<0 or mileage>1000000000) then mileage=nil end
+            rows[#rows+1]={i=tostring(lot.id),m=chatState.truncate(lot.model,96),p=price,
+                t=lot.marketTurbo==true or nil,tk=lot.marketTurboKnown==true or nil,km=mileage,
+                u=scanState.marketplace.tuning.clean(lot.marketTuning)}
+        end
+    end
+    table.sort(rows,function(a,b) return a.i<b.i end)
+    return rows
+end
+
+function scanState.marketplace.noteSignGone(objectId)
+    local object=scanState.mark.objects[objectId]
+    if not object or object.model~=scanState.mark.abModel or not scanState.mark.inAb() then return end
+    local px,py,pz=playerPos()
+    if not px or not object.x or not object.y or not object.z then return end
+    if dist3(px,py,pz,object.x,object.y,object.z)>25 then return end
+    for _,lot in ipairs(pendingSell.lots) do
+        if lot.marketObjectId==objectId and lot.marketObjectGeneration==object.generation then
+            lot.marketGoneAt=os.clock()
+        end
+    end
+end
+
+function scanState.marketplace.salePending(lotId)
+    for _,entry in ipairs(pendingSell.confirmations) do
+        if entry.action=='sell' and (entry.state=='waiting' or entry.state=='unresolved') then
+            for _,choice in ipairs(entry.candidates or {}) do if choice.id==lotId then return true end end
+        end
+    end
+    return false
+end
+
+function scanState.marketplace.mergeReceipt(found,model,price)
+    local candidate
+    for i,lot in ipairs(pendingSell.lots) do
+        if lot~=found and not lot.marketKey and lot.source=='chat' and lot.price==price
+            and pendingSell.sameModel(lot.model,model) and os.clock()-(lot.t or 0)<=15 then
+            if candidate then return false end
+            candidate=i
+        end
+    end
+    if not candidate then return false end
+    local merged=table.remove(pendingSell.lots,candidate)
+    for _,entry in ipairs(pendingSell.confirmations) do
+        local seen,choices={},{}
+        for _,choice in ipairs(entry.candidates or {}) do
+            if type(choice)=='table' and choice.id then
+                if choice.id==merged.id then choice.id=found.id end
+                if not seen[choice.id] then choices[#choices+1]=choice; seen[choice.id]=true end
+            end
+        end
+        entry.candidates=choices
+    end
+    found.marketChatConfirmed,found.marketNeedsChat=true,nil
+    return true
+end
+
+-- A streamed sign belonging to this nickname is also a server listing confirmation.
+function scanState.marketplace.observeOwn(text,model,price,turbo,owner,objectId,x,y,z)
+    local m=scanState.marketplace
+    if not m.enabled then return end
+    local nick=pendingSell.localNick()
+    if not nick or not owner or owner=='' then return end
+    local clean=scanState.mark.clean(text)
+    local rawOwner=clean:match('Владелец:%s*([^\r\n]+)') or ''
+    local ownerRealm,nickRealm=rawOwner:match('^%[(%d+)%]'),nick:match('^%[(%d+)%]')
+    local own=owner==normalizeName(nick:gsub('^%[%d+%]%s*',''))
+        and not (ownerRealm and nickRealm and tonumber(ownerRealm)~=tonumber(nickRealm))
+    local number=clean:match('^%s*Автомобиль №(%d+)') or clean:match('\nid:%s*(%d+)')
+    local key=number and ('vehicle:'..number)
+    if not key and x and y and z then key=('spot:%.1f:%.1f:%.1f'):format(x,y,z) end
+    if not key then return end
+    local object=objectId and scanState.mark.objects[objectId]
+    if own and object and m.retired[objectId]==object.generation then return end
+    if not own then
+        for i=#pendingSell.lots,1,-1 do
+            if pendingSell.lots[i].marketKey==key then pendingSell.removeLot(i) end
+        end
+        return
+    end
+    local found
+    for _,lot in ipairs(pendingSell.lots) do if lot.marketKey==key then found=lot; break end end
+    -- Material changes can give the same physical sign a new parking/vehicle label.
+    if not found and object then
+        for _,lot in ipairs(pendingSell.lots) do
+            if lot.marketObjectId==objectId and lot.marketObjectGeneration==object.generation
+                and not m.salePending(lot.id) then found=lot; break end
+        end
+    end
+    local relocated=false
+    if not found then
+        local candidate
+        for _,lot in ipairs(pendingSell.lots) do
+            local object=lot.marketObjectId and scanState.mark.objects[lot.marketObjectId]
+            local stillVisible=object and object.generation==lot.marketObjectGeneration
+            if lot.marketKey and not stillVisible and lot.marketGoneAt and os.clock()-lot.marketGoneAt<=30
+                and not m.salePending(lot.id) and pendingSell.sameModel(lot.model,model) then
+                if candidate then candidate=nil; break end
+                candidate=lot
+            end
+        end
+        if candidate then found,relocated=candidate,true end
+    end
+    if not found then
+        for _,lot in ipairs(pendingSell.lots) do
+            if not lot.marketKey and lot.price==price
+                and (isGenericCarName(lot.model) or pendingSell.sameModel(lot.model,model)) then found=lot; break end
+        end
+    end
+    if not found then
+        if not pendingSell.addLot(model,price,'market-plate') then return end
+        found=pendingSell.lots[#pendingSell.lots]
+    end
+    local moved=found.marketX and x and y and z and dist3(found.marketX,found.marketY,found.marketZ,x,y,z)>0.5
+    if not pendingSell.sameModel(found.model,model) then found.marketTuning=nil end
+    local replacing=found.marketKey and (relocated or moved or found.model~=model or found.price~=price)
+    local changed=found.model~=model or found.price~=price or found.marketKey~=key or moved
+    if replacing then
+        found.marketNeedsChat,found.marketChangedAt=true,os.clock()
+    end
+    found.model,found.price,found.marketKey,found.marketObjectId=model,price,key,objectId
+    found.marketX,found.marketY,found.marketZ=x,y,z
+    found.marketObservedAt=os.clock()
+    found.marketGoneAt=nil
+    found.marketObjectGeneration=objectId and scanState.mark.objects[objectId] and scanState.mark.objects[objectId].generation
+    found.marketObjectHandle=objectId and scanState.mark.objectHandle(objectId)
+    found.marketRestoreUntil=nil
+    found.marketSuppressed=nil
+    if objectId then m.pendingClears[objectId]=nil end
+    found.marketTurbo=turbo=='Twin Turbo' or nil
+    found.marketTurboKnown=true
+    local _,_,_,_,vice=scanState.mark.parseVice(text)
+    found.marketMileage=vice and vice.mileage or nil
+    if replacing and m.mergeReceipt(found,model,price) then changed=true end
+    if changed then saveDealLogs() end
+end
+
+function scanState.marketplace.reconcileRelocations()
+    local m,now=scanState.marketplace,os.clock()
+    for i=#pendingSell.lots,1,-1 do
+        local old=pendingSell.lots[i]
+        if old.marketGoneAt and now-old.marketGoneAt>=1 and now-old.marketGoneAt<=15 and not m.salePending(old.id) then
+            local object=old.marketObjectId and scanState.mark.objects[old.marketObjectId]
+            local stillVisible=object and object.generation==old.marketObjectGeneration
+            local replacement
+            if not stillVisible then
+                for _,lot in ipairs(pendingSell.lots) do
+                    local live=lot.marketObjectId and scanState.mark.objects[lot.marketObjectId]
+                    if lot~=old and lot.marketKey~=old.marketKey and live and live.generation==lot.marketObjectGeneration
+                        and (lot.source=='chat' or lot.marketChatConfirmed) and not m.salePending(lot.id)
+                        and (lot.marketObservedAt or -math.huge)>=old.marketGoneAt-2
+                        and now-(lot.marketObservedAt or -math.huge)<=15 and pendingSell.sameModel(lot.model,old.model) then
+                        if replacement then replacement=nil; break end
+                        replacement=lot
+                    end
+                end
+            end
+            if replacement then
+                table.remove(pendingSell.lots,i)
+                saveDealLogs()
+            end
+        end
+    end
+end
+
+function scanState.marketplace.cancelOwn(model)
+    local matches={}
+    local vehicle=scanState.marketplace.currentVehicle()
+    if vehicle then
+        for i=#pendingSell.lots,1,-1 do
+            local lot=pendingSell.lots[i]
+            if scanState.marketplace.vehicleIdentity(lot)==tostring(vehicle) and (not model or pendingSell.sameModel(lot.model,model)) then
+                pendingSell.removeLot(i)
+                return
+            end
+        end
+    end
+    for i,lot in ipairs(pendingSell.lots) do
+        if not model or pendingSell.sameModel(lot.model,model) then matches[#matches+1]=i end
+    end
+    if #matches==1 then pendingSell.removeLot(matches[1])
+    else
+        -- Do not keep advertising candidates when a generic cancellation is ambiguous.
+        for _,i in ipairs(matches) do
+            local lot=pendingSell.lots[i]
+            lot.marketSuppressed=true
+            scanState.marketplace.retire(lot)
+        end
+        saveDealLogs()
+    end
+end
+
+function scanState.marketplace.fingerprint(rows)
+    local parts={}
+    for _,row in ipairs(rows) do parts[#parts+1]=table.concat({row.i,row.m,row.p,row.t and 'tt' or '',row.km or '',row.tk and 'known' or '',row.u and encodeJson(row.u) or ''},'\1') end
+    return table.concat(parts,'\2')
+end
+
+function scanState.marketplace.ingest(line,ctx)
+    local m=scanState.marketplace
+    local active=m.viewCtx or m.ctx
+    if not ctx or not active or ctx.key~=active.key then return false end
+    if type(line)~='string' or #line>(scanState.cloud.url and 64000 or 16000) then return false end
+    local ok,event=safeDecodeJson(line)
+    if not ok or event.event~='message' or event.topic~=ctx.topic or type(event.message)~='string'
+        or #event.message>(scanState.cloud.url and 16000 or 4000) then return false end
+    local at=tonumber(event.time)
+    local now=m.now()
+    if not at or at~=at or at>now+60 or at+m.ttl<=now then return false end
+    local good,p=safeDecodeJson(event.message)
+    if not good or p.v~=1 or p.r~=ctx.room or p.c~=ctx.currency or type(p.s)~='string'
+        or #p.s<8 or #p.s>160 or type(p.n)~='string' or #p.n<1 or #p.n>64
+        or p.s:find('[%c]') or p.n:find('[%c]')
+        or type(p.b)~='number' or p.b<=0 or p.b>at+60 or p.b~=math.floor(p.b)
+        or type(p.q)~='number' or p.q<1 or p.q>1000000000 or p.q~=math.floor(p.q)
+        or type(p.l)~='table' or #p.l>32 then return false end
+    local previous=m.peers[p.s]
+    if previous and p.q<=previous.sequence then return false end
+    local rows,seen={},{}
+    for key in pairs(p.l) do if type(key)~='number' or key<1 or key~=math.floor(key) then return false end end
+    for _,row in ipairs(p.l) do
+        if type(row)~='table' or type(row.i)~='string' or #row.i<1 or #row.i>160
+            or type(row.m)~='string' or #row.m<1 or #row.m>96 or not scanState.mark.validModel(row.m)
+            or row.i:find('[%c]') or row.m:find('[%c]')
+            or not cleanPriceNum(row.p) or seen[row.i] then return false end
+        seen[row.i]=true
+        local mileage=tonumber(row.km)
+        if mileage and (mileage~=mileage or mileage<0 or mileage>1000000000) then mileage=nil end
+        rows[#rows+1]={key=p.s..'/'..row.i,id=row.i,model=normalizeName(chatState.truncate(row.m,96)),price=cleanPriceNum(row.p),
+            seller=chatState.truncate(p.n,64):gsub('[%c]',''),currency=p.c,turbo=row.t==true,
+            turboKnown=row.tk==true or row.t==true,mileage=mileage,updated=at,expires=at+m.ttl,
+            tuning=m.tuning.clean(row.u),tuningOmitted=row.ut==true}
+    end
+    if not previous then
+        local count=0
+        for _ in pairs(m.peers) do count=count+1 end
+        if count>=2048 then return false end
+    end
+    local publisher=scanState.cloud.url and type(p.d)=='string' and #p.d==36 and p.d or nil
+    local generation=publisher and type(p.g)=='number' and p.g>0 and p.g==math.floor(p.g) and p.g or 0
+    m.peers[p.s]={sequence=p.q,expires=at+m.ttl,rows=rows,seller=p.n,started=p.b,updated=at,publisher=publisher,generation=generation}
+    return true
+end
+
+function scanState.marketplace.prune()
+    local m=scanState.marketplace
+    for session,peer in pairs(m.peers) do if peer.expires<=m.now() then m.peers[session]=nil end end
+end
+
+function scanState.marketplace.publish(rows,closing)
+    local m=scanState.marketplace
+    local ctx=m.ctx
+    if not ctx or (m.sendBusy and not closing) then return end
+    m.sequence=m.sequence+1
+    local packet={v=1,r=ctx.room,c=ctx.currency,n=ctx.nick,s=m.session,b=m.started,q=m.sequence,l=rows}
+    local body=encodeJson(packet)
+    local fingerprint=m.fingerprint(rows)
+    local maxBody=scanState.cloud.url and 16000 or 3900
+    -- Optional details must never prevent the car itself from being published.
+    while #body>maxBody do
+        local largest,size=nil,0
+        for i,row in ipairs(rows) do
+            local bytes=row.u and #encodeJson(row.u) or 0
+            if bytes>size then largest,size=i,bytes end
+        end
+        if not largest then break end
+        rows[largest].u,rows[largest].ut=nil,true
+        body=encodeJson(packet)
+    end
+    if #rows>32 or #body>maxBody then m.status='Слишком много лотов для публикации'; m.nextSend=m.now()+60; return end
+    local generation=m.generation
+    m.sendBusy=true
+    m.publishStatus='Отправляю объявления…'
+    m.nextSend=m.now()+3
+    m.request('PUT','https://abarz.internal/'..ctx.topic,body,{
+        ['Content-Type']='text/plain; charset=utf-8',['User-Agent']='ABarz-market/1'},
+        function(reply,err,code)
+            if generation~=m.generation or m.ctx~=ctx then return end
+            m.sendBusy=false
+            if not err and not scanState.verifyNtfyAck(reply,ctx.topic,body) then err='Сервис не подтвердил публикацию лотов' end
+            if err or not reply or tonumber(code or 200)>=300 then
+                m.sendFailures=math.min(5,(m.sendFailures or 0)+1)
+                m.nextSend=m.now()+(tonumber(code)==429 and 600 or math.min(180,5*2^m.sendFailures))
+                m.status=tonumber(code)==429 and scanState.publicationError(err or reply,code)
+                    or ('Не удалось обновить объявления: '..tostring(err or code or '?'))
+                m.publishStatus=m.status
+                m.publishError=m.status
+                return
+            end
+            m.sendFailures=0
+            m.publishError=nil
+            m.lastFingerprint=fingerprint
+            m.needsInitialSnapshot=false
+            m.lastSent=m.now()
+            m.hadPublished=#rows>0
+            m.status='Каталог обновляется автоматически'
+            m.publishStatus='Мои объявления обновлены'
+        end,12)
+end
+
+function scanState.marketplace.close()
+    local m=scanState.marketplace
+    if m.ctx and (m.hadPublished or m.sendBusy) then m.publish({},true) end
+    m.generation=m.generation+1
+    m.ctx,m.session,m.sendBusy,m.pollBusy=nil,nil,false,false
+    m.peers,m.cursor={},nil
+    m.tuning.cache,m.tuning.attempted,m.tuning.stage,m.tuning.pending,m.tuning.sale,m.tuning.confirm={},{},nil,nil,nil,nil
+    m.viewCtx=nil
+    m.viewGeneration=m.viewGeneration+1
+    m.pendingClears={}
+    m.lastFingerprint,m.hadPublished=nil,false
+    m.publishError=nil
+    m.nextSend,m.nextPoll,m.lastSent=0,0,0
+end
+
+function scanState.marketplace.bind()
+    local m=scanState.marketplace
+    local ctx=m.enabled and m.context() or nil
+    if m.ctx and (not ctx or ctx.key~=m.ctx.key) then m.close() end
+    if ctx and not m.ctx then
+        m.generation=m.generation+1
+        m.ctx=ctx
+        m.started=m.now()
+        m.session=ensureChatCid()..'-'..chatState.truncate(ctx.nick,32)..'-market-'..m.generation..'-'..m.now()
+        m.sequence=0
+        m.needsInitialSnapshot=true
+        m.status='Подключение к каталогу'
+    end
+    return m.ctx
+end
+
+function scanState.marketplace.poll()
+    local m=scanState.marketplace
+    local ctx=m.viewCtx or m.ctx
+    if not ctx or m.pollBusy or m.now()<(m.pollBlockedUntil or 0) then return end
+    local generation=m.viewGeneration
+    m.pollBusy=true
+    local cursor=m.cursor or '5m'
+    m.request('GET','https://abarz.internal/'..ctx.topic..'/json?poll=1&since='..cursor,'',{
+        ['User-Agent']='ABarz-market/1',['Accept']='application/x-ndjson'},
+        function(body,err,code)
+            if generation~=m.viewGeneration or (m.viewCtx or m.ctx)~=ctx then return end
+            m.pollBusy=false
+            m.nextPoll=m.now()+(scanState.cloud.url and 30 or 15)
+            if err or not body or tonumber(code or 200)>=300 then
+                m.pollFailures=math.min(5,(m.pollFailures or 0)+1)
+                m.pollBlockedUntil=m.now()+(tonumber(code)==429 and 120 or math.min(120,5*2^m.pollFailures))
+                m.status='Каталог временно недоступен. Показаны ещё активные объявления.'
+                return
+            end
+            m.pollFailures,m.pollBlockedUntil=0,0
+            if #body>8000000 then m.status='Ответ каталога слишком большой'; return end
+            local count=0
+            for line in body:gmatch('[^\r\n]+') do
+                count=count+1
+                if count>5000 then break end
+                local ok,event=false,nil
+                if #line<=(scanState.cloud.url and 64000 or 16000) then ok,event=safeDecodeJson(line) end
+                if ok and event.event=='message' and event.topic==ctx.topic and type(event.id)=='string'
+                    and event.id:match('^[%w_%-]+$') and #event.id<=100 then m.cursor=event.id end
+                m.ingest(line,ctx)
+            end
+            m.lastPoll=m.now()
+            m.status='Каталог обновлён'
+            m.prune()
+        end,12)
+end
+
+function scanState.marketplace.rows(filter,minimum,maximum,onlyTT,ownOnly)
+    local m=scanState.marketplace
+    local view=m.viewCtx or m.ctx
+    local localRoom=m.ctx and view and view.room==m.ctx.room
+    m.prune()
+    local result={}
+    filter=foldName(filter or '')
+    local function add(row)
+        if (not minimum or row.price>=minimum) and (not maximum or row.price<=maximum)
+            and (not onlyTT or row.turbo) and (not ownOnly or row.own)
+            and (filter=='' or foldName(row.model..' '..row.seller):find(filter,1,true)) then result[#result+1]=row end
+    end
+    local latest={}
+    for session,peer in pairs(m.peers) do
+        local owner=peer.publisher or peer.seller
+        local previous=latest[owner]
+        if not previous or (peer.generation or 0)>(previous.peer.generation or 0)
+            or ((peer.generation or 0)==(previous.peer.generation or 0) and (peer.started>previous.peer.started
+            or (peer.started==previous.peer.started and session>previous.session))) then
+            latest[owner]={session=session,peer=peer}
+        end
+    end
+    for _,entry in pairs(latest) do
+        local own=localRoom and (entry.peer.publisher and scanState.cloud.device and entry.peer.publisher==scanState.cloud.device.deviceId
+            or (not entry.peer.publisher and entry.peer.seller==m.ctx.nick))
+        if not own then for _,row in ipairs(entry.peer.rows) do add(row) end end
+    end
+    if localRoom then
+        for _,lot in ipairs(m.collect()) do
+            add({key=m.session..'/'..lot.i,id=lot.i,model=lot.m,price=lot.p,seller=m.ctx.nick,
+                currency=m.ctx.currency,turbo=lot.t==true,turboKnown=lot.tk==true or lot.t==true,mileage=lot.km,own=true,updated=m.now(),
+                tuning=lot.u})
+        end
+    end
+    table.sort(result,function(a,b)
+        if a.price~=b.price then return a.price<b.price end
+        if a.model~=b.model then return a.model<b.model end
+        return a.key<b.key
+    end)
+    return result
+end
+
+function scanState.marketplace.modelOffers(selected)
+    local stats={count=0,others=0}
+    for _,row in ipairs(scanState.marketplace.rows('')) do
+        if row.currency==selected.currency and pendingSell.sameModel(row.model,selected.model) then
+            stats.count=stats.count+1
+            if row.key~=selected.key then stats.others=stats.others+1 end
+            stats.minimum=math.min(stats.minimum or row.price,row.price)
+            stats.maximum=math.max(stats.maximum or row.price,row.price)
+        end
+    end
+    return stats
+end
+
+function scanState.marketplace.modelAverage(model,view)
+    if not view or view.currency~='$' then return end
+    local m=scanState.marketplace
+    local average,name,info
+    if scanState.priceStore and scanState.priceStore.room==view.room and not scanState.priceSwitchPending then
+        average,name=resolveAvgForModel(model)
+        info=name and prices[name]
+    else
+        local host,port=view.room:match('^([^:]+):(%d+)$')
+        local server=host and scanState.pricesIdentity(host,port)
+        if not server or server.vice then return end
+        m.priceCaches=m.priceCaches or {}
+        local cache=m.priceCaches[view.room]
+        if not cache or m.now()-cache.at>=30 then
+            cache={at=m.now(),prices={},matches={}}
+            for _,path in ipairs({server.path,server.path..'.bak'}) do
+                local f=io.open(path,'r')
+                if f then
+                    local raw=f:read(4000001); f:close()
+                    local ok,data=false,nil
+                    if type(raw)=='string' and #raw<=4000000 then ok,data=safeDecodeJson(raw) end
+                    if ok and (not data.server or data.server==server.room) and type(data.prices)=='table' then
+                        cache.prices=data.prices; break
+                    end
+                end
+            end
+            m.priceCaches[view.room]=cache
+        end
+        local key=foldName(model)
+        local match=cache.matches[key]
+        if match==nil then
+            local exact,similar,ambiguous
+            for candidate,value in pairs(cache.prices) do
+                if type(candidate)=='string' and type(value)=='table' and cleanPriceNum(value.price) then
+                    if foldName(candidate)==key then exact=candidate; break end
+                    if pendingSell.sameModel(candidate,model) then
+                        if similar then ambiguous=true end
+                        similar=candidate
+                    end
+                end
+            end
+            match=exact or (not ambiguous and similar) or false
+            cache.matches[key]=match
+        end
+        info=match and cache.prices[match]
+        average=info and cleanPriceNum(info.price)
+    end
+    if not average or not info then return end
+    local result={price=average,days=0,sales=0,countDays=0}
+    for _,day in ipairs(type(info.days)=='table' and info.days or {}) do
+        if type(day)=='table' and cleanPriceNum(day.price) then
+            result.days=result.days+1
+            local count=tonumber(day.count)
+            if count and count==count and count>=0 and count<1000000000 and count==math.floor(count) then
+                result.sales=result.sales+count; result.countDays=result.countDays+1
+            end
+            local date=normalizeDate(day.date or '')
+            if date:match('^%d%d%d%d%-%d%d%-%d%d$') and (not result.date or date>result.date) then result.date=date end
+        end
+    end
+    return result
+end
+
+function scanState.marketplace.pump()
+    local m=scanState.marketplace
+    m.sharing=true
+    m.bind()
+    local view=m.bindView()
+    if not m.ctx then
+        m.prune()
+        if view and m.now()-(m.visibleAt or 0)<=2 and m.now()>=m.nextPoll then m.poll() end
+        return
+    end
+    m.reconcileIdentities()
+    m.tuning.pump()
+    m.reconcileRelocations()
+    -- Close-range removal is confirmed after a grace period for a moved/recreated sign.
+    -- Keep the receipt for sale accounting; only withdraw its public advertisement.
+    for _,lot in ipairs(pendingSell.lots) do
+        if lot.marketGoneAt and os.clock()-lot.marketGoneAt>=3 and not lot.marketSuppressed then
+            local object=lot.marketObjectId and scanState.mark.objects[lot.marketObjectId]
+            if not object or object.generation~=lot.marketObjectGeneration then
+                lot.marketSuppressed=true
+                saveDealLogs()
+            end
+        end
+    end
+    for objectId,notice in pairs(m.pendingClears) do
+        for i=#pendingSell.lots,1,-1 do
+            local lot=pendingSell.lots[i]
+            if lot.marketObjectId==objectId and lot.marketObjectGeneration==notice.generation then pendingSell.removeLot(i) end
+        end
+        m.pendingClears[objectId]=nil
+    end
+    m.prune()
+    local rows=m.collect()
+    local fingerprint=m.fingerprint(rows)
+    local changed=m.needsInitialSnapshot or (fingerprint~=m.lastFingerprint and (#rows>0 or m.hadPublished))
+    if not m.sendBusy and m.now()>=m.nextSend and (changed or (#rows>0 and m.now()-(m.lastSent or 0)>=m.heartbeat)) then
+        m.publish(rows)
+    end
+    if m.now()-(m.visibleAt or 0)<=2 and m.now()>=m.nextPoll then m.poll() end
+end
+
+
+
 local win = new.bool(false)
 
 scanState.keyName = function(vk)
@@ -4825,6 +6330,7 @@ scanState.saveSettings = function()
             chatOn = not not scanState.chatBindOn[0],
             mouseOn = not not scanState.mouseBindOn[0],
             autoOn = not not scanState.autoUpdateOn[0],
+            marketBrowseServer = scanState.marketplace.selectedServer,
             uiScale = scanState.uiScale or 1,
         }))
         f:close()
@@ -4845,6 +6351,8 @@ scanState.loadSettings = function()
         if data.menuOn ~= nil then scanState.menuBindOn[0] = not not data.menuOn end
         if data.chatOn ~= nil then scanState.chatBindOn[0] = not not data.chatOn end
         if data.mouseOn ~= nil then scanState.mouseBindOn[0] = not not data.mouseOn end
+        if data.autoOn ~= nil then scanState.autoUpdateOn[0] = not not data.autoOn end
+        scanState.marketplace.selectServer(data.marketBrowseServer or 0)
         local scale = tonumber(data.uiScale)
         if scale and scale == scale then scanState.uiScale = math.max(0.6, math.min(1.2, scale)) end
     end)
@@ -4936,7 +6444,7 @@ function scanState.scaledUi(raw, getScale)
         local method=name
         ui[method]=function(n) return raw[method](n*getScale()) end
     end
-    for _, name in ipairs({'GetWindowPos','GetWindowSize','GetContentRegionAvail'}) do
+    for _, name in ipairs({'GetWindowPos','GetWindowSize','GetContentRegionAvail','GetItemRectMin','GetItemRectMax','GetMousePos','GetCursorScreenPos'}) do
         local method=name
         ui[method]=function() return logical(raw[method]()) end
     end
@@ -4947,7 +6455,13 @@ function scanState.scaledUi(raw, getScale)
             spacing and spacing >= 0 and spacing*getScale() or -1)
     end
     ui.Button=function(label, size) return raw.Button(label, size and vec(size) or raw.ImVec2(0,0)) end
+    ui.Selectable=function(label,selected,flags,size)
+        if size then return raw.Selectable(label,selected,flags or 0,vec(size)) end
+        return raw.Selectable(label,selected,flags or 0)
+    end
     ui.Image=function(texture, size, ...) return raw.Image(texture,vec(size),...) end
+    ui.InvisibleButton=function(label,size) return raw.InvisibleButton(label,vec(size)) end
+    ui.CalcTextSize=function(...) return logical(raw.CalcTextSize(...)) end
     ui.Begin=function(...)
         local visible=raw.Begin(...); raw.SetWindowFontScale(getScale()); return visible
     end
@@ -4968,6 +6482,16 @@ function scanState.scaledUi(raw, getScale)
             AddCircleFilled=function(_,pos,radius,...)
                 return dl:AddCircleFilled(vec(pos),radius*getScale(),...)
             end,
+            AddLine=function(_,a,b,color,thickness)
+                return dl:AddLine(vec(a),vec(b),color,(thickness or 1)*getScale())
+            end,
+            AddRect=function(_,a,b,color,rounding,corners,thickness)
+                return dl:AddRect(vec(a),vec(b),color,(rounding or 0)*getScale(),corners,(thickness or 1)*getScale())
+            end,
+            AddText=function(_,pos,color,text) return dl:AddText(vec(pos),color,text) end,
+            AddQuadFilled=function(_,a,b,c,d,color)
+                return dl:AddQuadFilled(vec(a),vec(b),vec(c),vec(d),color)
+            end,
         }
     end
     return ui
@@ -4983,6 +6507,9 @@ local searchBuf = new.char[64]()
 local dealModelBuf = new.char[64]()
 local dealSearchBuf = new.char[64]()
 local dealPriceBuf = new.char[32]()
+local marketOwn=new.bool(false)
+local marketSort=new.int(0)
+local marketSelected
 local function setCString(buf, cap, s)
     s = tostring(s or '')
     if #s >= cap then s = s:sub(1, cap - 1) end
@@ -4996,6 +6523,7 @@ local CHAT_W, CHAT_H = 380, 470
 local accentCol = { 0.36, 0.58, 1.0 }
 local PAGES = {
     { id = 'base', title = 'Цены' },
+    { id = 'marketplace', title = 'Маркетплейс' },
     { id = 'scan', title = 'Сканирование' },
     { id = 'deals', title = 'Сделки' },
     { id = 'chat', title = 'Чат' },
@@ -5117,6 +6645,146 @@ local function dealTotals()
 end
 
 local baseTab, dealsTab, settingsTab = 1, 1, 1
+local baseDetailsOpen = false
+
+local function chartDate(date)
+    local year,month,day=date:match('^(%d%d%d%d)%-(%d%d)%-(%d%d)$')
+    return day and (day..'.'..month..'.'..year) or date
+end
+
+local function drawPriceHistory(days, chartHeight)
+    local history=scanState.priceHistory(days)
+    local points=history.points
+    if #points==0 then
+        imgui.TextWrapped('Нет данных по дням. Обновите базу сканированием средних цен.')
+        return
+    end
+    local width=math.max(160,imgui.GetContentRegionAvail().x)
+    local height=chartHeight or 224
+    local origin=imgui.GetCursorScreenPos()
+    imgui.InvisibleButton('##carPriceHistory',imgui.ImVec2(width,height))
+    local hovered=imgui.IsItemHovered()
+    local dl=imgui.GetWindowDrawList()
+    local function v(x,y) return imgui.ImVec2(origin.x+x,origin.y+y) end
+    dl:AddRectFilled(origin,v(width,height),u32(0.06,0.09,0.14,0.8),10)
+    dl:AddRect(origin,v(width,height),u32(accentCol[1],accentCol[2],accentCol[3],0.25),10,nil,1)
+    local left,right,top,bottom=82,width-24,22,height-34
+    local range=history.max-history.min
+    local padding=math.max(range*0.08,history.max*0.02,1)
+    local low,high=math.max(0,history.min-padding),history.max+padding
+    local plot={}
+    for i,point in ipairs(points) do
+        local t=#points==1 and 0.5 or (point.ordinal-points[1].ordinal)/(points[#points].ordinal-points[1].ordinal)
+        plot[i]={x=left+t*(right-left),y=bottom-(point.price-low)/(high-low)*(bottom-top)}
+    end
+    local function shortMoney(n)
+        local divisor,suffix=1,''
+        if n>=1000000000 then divisor,suffix=1000000000,'B'
+        elseif n>=1000000 then divisor,suffix=1000000,'M'
+        elseif n>=1000 then divisor,suffix=1000,'K' end
+        local label=divisor==1 and tostring(math.floor(n+0.5)) or ('%.1f'):format(n/divisor):gsub('%.0$','')
+        return '$'..label..suffix
+    end
+    for tick=0,4 do
+        local y=bottom-(bottom-top)*tick/4
+        local label=shortMoney(low+(high-low)*tick/4)
+        local size=imgui.CalcTextSize(label)
+        dl:AddLine(v(left,y),v(right,y),u32(1,1,1,0.07),1)
+        dl:AddText(v(left-size.x-12,y-size.y/2),u32(0.54,0.62,0.74,1),label)
+    end
+    local previousLabelEnd=-math.huge
+    local ticks=math.min(6,#points)
+    local lastLabelWidth=imgui.CalcTextSize(chartDate(points[#points].date):sub(1,5)).x
+    for tick=1,ticks do
+        local index=ticks==1 and 1 or math.floor((tick-1)*(#points-1)/(ticks-1)+0.5)+1
+        local point,xy=points[index],plot[index]
+        local label=chartDate(point.date):sub(1,5)
+        local size=imgui.CalcTextSize(label)
+        local x=math.max(left,math.min(right-size.x,xy.x-size.x/2))
+        if tick==ticks or tick==1 or (x>=previousLabelEnd+12 and x+size.x+12<=right-lastLabelWidth) then
+            dl:AddLine(v(xy.x,top),v(xy.x,bottom),u32(1,1,1,0.035),1)
+            dl:AddText(v(x,bottom+10),u32(0.54,0.62,0.74,1),label)
+            previousLabelEnd=x+size.x
+        end
+    end
+    for i=2,#plot do
+        local a,b=plot[i-1],plot[i]
+        -- A few translucent strips make the area fade towards the baseline.
+        for band=0,7 do
+            local t0,t1=band/8,(band+1)/8
+            dl:AddQuadFilled(v(a.x,a.y+(bottom-a.y)*t0),v(b.x,b.y+(bottom-b.y)*t0),
+                v(b.x,b.y+(bottom-b.y)*t1),v(a.x,a.y+(bottom-a.y)*t1),
+                u32(accentCol[1],accentCol[2],accentCol[3],0.2*(1-(t0+t1)/2)))
+        end
+    end
+    for i=2,#plot do dl:AddLine(v(plot[i-1].x,plot[i-1].y),v(plot[i].x,plot[i].y),u32(accentCol[1],accentCol[2],accentCol[3],1),2.3) end
+    if #plot==1 then dl:AddCircleFilled(v(plot[1].x,plot[1].y),3.5,u32(accentCol[1],accentCol[2],accentCol[3],1),16) end
+    if hovered then
+        local mouse=imgui.GetMousePos()
+        local closest,distance=1,math.huge
+        for i,xy in ipairs(plot) do
+            local d=math.abs(mouse.x-origin.x-xy.x)
+            if d<distance then closest,distance=i,d end
+        end
+        local xy,point=plot[closest],points[closest]
+        dl:AddLine(v(xy.x,top),v(xy.x,bottom),u32(0.8,0.88,1,0.35),1)
+        dl:AddCircleFilled(v(xy.x,xy.y),4,u32(0.8,0.9,1,1),16)
+        local tip=chartDate(point.date)..'\n'..fmtMoney(point.price)
+        if point.count then tip=tip..'\nПродаж: '..point.count end
+        imgui.SetTooltip(tip)
+    end
+end
+
+local function drawCarDetails(name,info)
+    local width=imgui.GetContentRegionAvail().x
+    if actionButton('‹ Назад',imgui.ImVec2(100,30)) then baseDetailsOpen=false end
+    imgui.SameLine(120)
+    imgui.Text(name)
+    spaced(0,10)
+    local history=scanState.priceHistory(info.days)
+    local photoWidth=math.min(230,width*0.3)
+    imgui.BeginChild('##carPhoto',imgui.ImVec2(photoWidth,220),false)
+        carImg.drawPreview(name,photoWidth*uiScale,uiScale,true)
+        imgui.TextDisabled('Средняя за период')
+        imgui.TextColored(accent(),fmtMoney(info.price or 0))
+        local sales=history.countDays>0 and tostring(history.sales) or '—'
+        imgui.TextDisabled('Продаж за период: '..sales..(history.countDays<#history.points and ' (не все дни)' or ''))
+    imgui.EndChild()
+    imgui.SameLine()
+    local tableWidth=width-photoWidth-10
+    imgui.BeginChild('##carDayTable',imgui.ImVec2(-1,220),true)
+        imgui.SetCursorPos(imgui.ImVec2(12,10))
+        imgui.TextDisabled('Дата')
+        imgui.SameLine(tableWidth*0.35)
+        imgui.TextDisabled('Кол-во продаж')
+        imgui.SameLine(tableWidth*0.62)
+        imgui.TextDisabled('Средняя цена за день')
+        spaced(0,4)
+        imgui.Separator()
+        for i=#history.points,1,-1 do
+            local point=history.points[i]
+            imgui.SetCursorPosX(12)
+            imgui.Text(chartDate(point.date))
+            imgui.SameLine(tableWidth*0.4)
+            imgui.Text(point.count and tostring(point.count) or '—')
+            imgui.SameLine(tableWidth*0.62)
+            imgui.TextColored(accent(),fmtMoney(point.price))
+            imgui.Separator()
+        end
+        if #history.points==0 then imgui.TextDisabled('Нет истории продаж.') end
+    imgui.EndChild()
+    spaced(0,10)
+    drawPriceHistory(info.days,224)
+    if #history.points>0 then
+        imgui.TextDisabled(('Изменение за период: %+.1f%%'):format(history.percent))
+        for _,point in ipairs(history.points) do
+            if point.count==nil then
+                imgui.TextWrapped('«—» — количество продаж не сохранено. Обновите базу сканированием.')
+                break
+            end
+        end
+    end
+end
 
 local function tabs(id, titles, current)
     for i, title in ipairs(titles) do
@@ -5127,6 +6795,210 @@ local function tabs(id, titles, current)
     imgui.Separator()
     spaced(0, 8)
     return current
+end
+
+local function marketValue(label,value,color,scale)
+    imgui.TextDisabled(label)
+    imgui.SameLine(150)
+    imgui.SetWindowFontScale(scale or 1.0)
+    if color then imgui.PushStyleColor(imgui.Col.Text,color) end
+    imgui.TextWrapped(tostring(value))
+    if color then imgui.PopStyleColor() end
+    imgui.SetWindowFontScale(1.0)
+end
+
+local function drawMarketplaceContent()
+    local m=scanState.marketplace
+    m.visibleAt=m.now()
+    sectionTitle('Маркетплейс игроков ABarz')
+    local view=m.bindView()
+    imgui.SetNextItemWidth(340)
+    local selectedServer=m.selectedServer==0 and (m.roomLabel(m.ctx and m.ctx.room)..' · сейчас')
+        or m.serverLabel(m.selectedServer)
+    if imgui.BeginCombo('##marketServer',selectedServer) then
+        for _,index in ipairs(m.serverOrder()) do
+            local title=index==0 and ('Текущий сервер · '..m.roomLabel(m.ctx and m.ctx.room)) or m.serverLabel(index)
+            if imgui.Selectable(title,m.selectedServer==index) then
+                m.selectServer(index)
+                marketSelected=nil
+                scanState.saveSettings()
+            end
+        end
+        imgui.EndCombo()
+    end
+    imgui.SameLine()
+    view=m.viewCtx
+    if imgui.SmallButton('Обновить каталог') then m.nextPoll=m.now() end
+    if m.publishError then imgui.TextWrapped(m.publishError) end
+    if (m.pollFailures or 0)>0 then imgui.TextWrapped(m.status) end
+    if not view then
+        imgui.TextWrapped('Выберите сервер в списке или подключитесь к игре. Здесь будут объявления продавцов с ABarz.')
+        return
+    end
+    spaced(0,6)
+    local toolbarWidth=imgui.GetContentRegionAvail().x
+    if navButton('Все лоты##marketScope',not marketOwn[0],104) then marketOwn[0]=false end
+    imgui.SameLine()
+    if navButton('Мои##marketScope',marketOwn[0],76) then marketOwn[0]=true end
+    local rows=m.rows('',nil,nil,false,marketOwn[0])
+    imgui.SameLine(math.max(260,toolbarWidth-185))
+    imgui.SetNextItemWidth(185)
+    local sorts={'Сначала дешевле','Сначала дороже','Свежие объявления'}
+    if imgui.BeginCombo('##marketSort',sorts[marketSort[0]+1]) then
+        for i,title in ipairs(sorts) do
+            if imgui.Selectable(title,marketSort[0]==i-1) then marketSort[0]=i-1 end
+        end
+        imgui.EndCombo()
+    end
+    if marketSort[0]==1 then table.sort(rows,function(a,b) return a.price>b.price end)
+    elseif marketSort[0]==2 then table.sort(rows,function(a,b) return a.updated>b.updated end) end
+    local selected
+    for _,row in ipairs(rows) do if row.key==marketSelected then selected=row; break end end
+    selected=selected or rows[1]
+    marketSelected=selected and selected.key or nil
+    spaced(0,8)
+    local height=math.max(180,imgui.GetContentRegionAvail().y-30)
+    local listWidth=math.max(310,math.min(360,imgui.GetContentRegionAvail().x*0.45))
+    imgui.BeginChild('##marketList',imgui.ImVec2(listWidth,height),true)
+        imgui.SetCursorPos(imgui.ImVec2(14,10))
+        imgui.TextDisabled(('Объявления · %d'):format(#rows))
+        spaced(0,4)
+        for _,row in ipairs(rows) do
+            imgui.PushIDStr(row.key)
+            local active=marketSelected==row.key
+            local titleLines=math.min(3,math.max(1,math.ceil(imgui.CalcTextSize(row.model).x/(listWidth-32))))
+            local rowHeight=62+17*titleLines
+            imgui.SetCursorPosX(6)
+            imgui.PushStyleColor(imgui.Col.ChildBg,active and accentDim(0.16) or imgui.ImVec4(0,0,0,0))
+            imgui.BeginChild('##marketRow',imgui.ImVec2(-6,rowHeight),false)
+            local hitWidth=math.max(1,imgui.GetContentRegionAvail().x)
+            if imgui.Selectable('##selectLot',false,0,imgui.ImVec2(hitWidth,rowHeight-4)) then marketSelected,selected=row.key,row end
+            imgui.SetCursorPos(imgui.ImVec2(10,8))
+            imgui.PushStyleColor(imgui.Col.Text,active and accent() or imgui.ImVec4(0.9,0.92,0.95,1))
+            imgui.TextWrapped(row.model)
+            imgui.PopStyleColor()
+            imgui.TextColored(imgui.ImVec4(0.84,0.87,0.92,1),fmtMoney(row.price,row.currency))
+            imgui.SetWindowFontScale(0.86)
+            imgui.TextDisabled(row.seller..(row.own and ' · ваш лот' or ''))
+            imgui.SetWindowFontScale(1.0)
+            imgui.EndChild()
+            imgui.PopStyleColor()
+            spaced(0,3)
+            imgui.PopID()
+        end
+        if #rows==0 then imgui.TextWrapped('Объявлений пока нет. Лоты появятся, когда игроки с ABarz выставят машины на продажу.') end
+    imgui.EndChild()
+    imgui.SameLine()
+    imgui.BeginChild('##marketDetails',imgui.ImVec2(-1,height),false)
+        imgui.SetCursorPos(imgui.ImVec2(14,10))
+        imgui.BeginChild('##marketDetailsContent',imgui.ImVec2(-14,-10),false)
+        if selected then
+            local average=m.modelAverage(selected.model,view)
+            local titleWidth=math.max(100,imgui.GetContentRegionAvail().x-110)
+            local titleHeight=math.max(64,math.ceil(imgui.CalcTextSize(selected.model).x*1.16/titleWidth)*22+26)
+            carImg.drawThumbnail(selected.model,96,uiScale)
+            imgui.SameLine()
+            imgui.BeginChild('##marketTitle',imgui.ImVec2(-1,titleHeight),false)
+                imgui.SetWindowFontScale(1.16)
+                imgui.TextWrapped(selected.model)
+                imgui.SetWindowFontScale(1.0)
+                imgui.TextDisabled(m.roomLabel(view.room))
+            imgui.EndChild()
+            spaced(0,10)
+            marketValue('Цена лота',fmtMoney(selected.price,selected.currency),accent(),1.20)
+            if average then
+                marketValue('Средняя сервера',fmtMoney(average.price,selected.currency))
+                local delta=selected.price-average.price
+                local percent=math.abs(delta)/average.price*100
+                local color=delta<0 and imgui.ImVec4(0.45,0.85,0.55,1)
+                    or (delta>0 and imgui.ImVec4(0.95,0.45,0.45,1) or imgui.ImVec4(0.68,0.72,0.78,1))
+                local comparison=delta==0 and 'На уровне средней цены' or
+                    (('%s на %s (%.1f%%)'):format(delta<0 and 'Дешевле' or 'Дороже',fmtMoney(math.abs(delta),selected.currency),percent))
+                marketValue('К средней цене',comparison,color,0.96)
+                if average.countDays>0 then
+                    marketValue('Продажи',('%d за %d дней%s'):format(average.sales,average.days,
+                        average.countDays<average.days and ' · неполные данные' or ''))
+                end
+                if average.date then marketValue('Данные на',chartDate(average.date)) end
+            else
+                imgui.TextWrapped(selected.currency=='VC$' and 'На Vice City нет системной средней цены.'
+                    or 'Средняя цена этого сервера ещё не сохранена.')
+            end
+            spaced(0,8)
+            imgui.Separator()
+            spaced(0,8)
+            marketValue('Продавец',selected.seller)
+            if imgui.IsItemHovered() then imgui.SetTooltip('Ник передан скриптом продавца. Сервер Arizona его не подтверждает.') end
+            marketValue('Тюнинг',selected.turbo and 'Twin Turbo' or (selected.turboKnown and 'Без Twin Turbo' or 'Не указан'),
+                selected.turbo and accent() or nil)
+            imgui.SetCursorPosX(150)
+            if imgui.SmallButton('Скопировать ник') and type(setClipboardText)=='function' then setClipboardText(selected.seller) end
+            imgui.SameLine()
+            if selected.own then
+                if m.lastFingerprint~=m.fingerprint(m.collect()) then imgui.TextDisabled(m.publishStatus or 'Ожидает публикации')
+                else imgui.TextDisabled('Ваше объявление') end
+            else
+                imgui.TextDisabled(('Обновлено %d сек. назад'):format(math.max(0,m.now()-selected.updated)))
+            end
+            spaced(0,8)
+            imgui.Separator()
+            spaced(0,8)
+            imgui.TextDisabled('Установленный тюнинг')
+            if selected.tuning then
+                local count=0
+                for _,group in ipairs({{'t','Технический'},{'v','Визуальный'},{'p','Винил'},{'m','Модификация'},{'n','Номер'}}) do
+                    local items=selected.tuning[group[1]]
+                    if items and #items>0 then
+                        count=count+#items
+                        imgui.Text(group[2])
+                        for _,name in ipairs(items) do imgui.TextWrapped('• '..name) end
+                        spaced(0,4)
+                    end
+                end
+                if count==0 then imgui.TextDisabled('В считанных разделах деталей нет') end
+            else
+                imgui.TextWrapped(selected.tuningOmitted and 'Полный список деталей не передан: превышен размер объявления.'
+                    or 'Тюнинг ещё не считан продавцом.')
+            end
+            local vehicle=selected.own and m.vehicleIdentity({marketKey=selected.id})
+            if selected.own then
+                for _,lot in ipairs(pendingSell.lots) do if lot.id==selected.id then vehicle=m.vehicleIdentity(lot); break end end
+                if vehicle and m.currentVehicle()==tonumber(vehicle) then
+                    if imgui.SmallButton('Считать тюнинг') then
+                        for _,lot in ipairs(pendingSell.lots) do if lot.id==selected.id then lot.marketTuning=nil; break end end
+                        m.tuning.cache[m.ctx.room..'/'..vehicle]=nil
+                        m.tuning.force=vehicle
+                    end
+                    if m.tuning.pending then imgui.TextDisabled('Запрашиваю детали автомобиля…') end
+                end
+            end
+        elseif #pendingSell.lots>0 then
+            imgui.TextWrapped('Не удалось определить модель вашего лота или есть неуточнённая продажа. Откройте табличку машины либо вкладку «Сделки».')
+        else
+            imgui.TextDisabled('Объявления выбранного сервера')
+            imgui.TextWrapped('Выберите машину в списке слева, чтобы посмотреть цену и данные продавца.')
+        end
+        imgui.EndChild()
+    imgui.EndChild()
+    imgui.TextDisabled('Лоты игроков ABarz · при потере связи объявление хранится до 5 минут.')
+end
+
+local function drawMarketplace()
+    imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing,imgui.ImVec2(10,4))
+    imgui.PushStyleColor(imgui.Col.ChildBg,imgui.ImVec4(0.055,0.064,0.085,1))
+    imgui.PushStyleColor(imgui.Col.FrameBg,imgui.ImVec4(0.11,0.13,0.16,1))
+    imgui.PushStyleColor(imgui.Col.Button,imgui.ImVec4(0.12,0.14,0.18,1))
+    imgui.PushStyleColor(imgui.Col.TextDisabled,imgui.ImVec4(0.61,0.65,0.72,1))
+    imgui.BeginChild('##marketWorkspace',imgui.ImVec2(-1,-1),false)
+    imgui.SetCursorPos(imgui.ImVec2(16,14))
+    imgui.PushStyleColor(imgui.Col.ChildBg,imgui.ImVec4(0,0,0,0))
+    imgui.BeginChild('##marketWorkspaceBody',imgui.ImVec2(-16,-14),false)
+        drawMarketplaceContent()
+    imgui.EndChild()
+    imgui.PopStyleColor()
+    imgui.EndChild()
+    imgui.PopStyleColor(4)
+    imgui.PopStyleVar()
 end
 
 local function drawChatPage()
@@ -5153,6 +7025,37 @@ local function drawChatPage()
 end
 
 local function drawBase()
+    if scanState.isViceCity() then
+        sectionTitle('Лоты Vice City')
+        imgui.TextWrapped('Системных средних цен здесь нет. Ниже — найденные таблички продажи, а не история совершённых сделок.')
+        imgui.SetNextItemWidth(-1)
+        if imgui.InputTextWithHint('##vcSearch','Модель или владелец...',searchBuf,64) then
+            filter=ffi.string(searchBuf)
+        end
+        local offers=scanState.viceOffers(filter)
+        imgui.TextDisabled(('Найдено лотов: %d. Пройдите по автосалону, чтобы получить таблички.'):format(#offers))
+        spaced(0,8)
+        imgui.BeginChild('##vcOffers',imgui.ImVec2(-1,WIN_H-235),false)
+        for _,row in ipairs(offers) do
+            imgui.PushIDStr(tostring(row.key or row.vice.number))
+            imgui.Text(row.model)
+            imgui.SameLine(350)
+            imgui.TextColored(accent(),fmtMoney(row.price))
+            local details=('Лот №%s · %s'):format(row.vice.number,row.owner or 'владелец неизвестен')
+            if row.vice.mileage then details=details..(' · %s км'):format(row.vice.mileage) end
+            imgui.TextDisabled(details)
+            if row.vice.expires then imgui.TextDisabled(row.vice.expires) end
+            imgui.Separator()
+            imgui.PopID()
+        end
+        if #offers==0 then imgui.TextDisabled('Подходящих табличек пока нет.') end
+        imgui.EndChild()
+        return
+    end
+    if baseDetailsOpen and baseTab==1 and selectedName and prices[selectedName] then
+        drawCarDetails(selectedName,prices[selectedName])
+        return
+    end
     baseTab = tabs('base', {'Цены', 'Обмен базой', 'Хранение'}, baseTab)
     if baseTab == 2 then
         sectionTitle('Обмен базой цен')
@@ -5190,16 +7093,23 @@ local function drawBase()
     end
     sectionTitle('Цены автобазара')
     imgui.SetNextItemWidth(-1)
-    if imgui.InputTextWithHint('##search', 'Поиск машины...', searchBuf, 64) then
+    if imgui.InputTextWithHint('##search', 'Поиск по названию машины...', searchBuf, 64) then
         filter = ffi.string(searchBuf)
     end
     spaced(0, 4)
     local rows = findPrices(filter)
     local listH = WIN_H - 224
-    local leftW = 440
+    local leftW = imgui.GetContentRegionAvail().x
+    if (not selectedName or not prices[selectedName]) and rows[1] then selectedName=rows[1].name end
     imgui.BeginChild('##left', imgui.ImVec2(leftW, listH), true)
         imgui.TextDisabled(('Машины  ·  %d'):format(#rows))
         spaced(0, 2)
+        imgui.TextDisabled('Модель транспорта')
+        imgui.SameLine(leftW*0.60)
+        imgui.TextDisabled('Дней в базе')
+        imgui.SameLine(leftW*0.77)
+        imgui.TextDisabled('Средняя цена')
+        imgui.Separator()
         if #rows == 0 then
             imgui.TextDisabled('Пока пусто — сначала скан')
         else
@@ -5207,50 +7117,25 @@ local function drawBase()
                 imgui.PushIDStr('c' .. i)
                 if imgui.Selectable(row.name, selectedName == row.name) then
                     selectedName = row.name
+                    baseDetailsOpen=true
                 end
-                imgui.SameLine(250)
-                imgui.TextDisabled(('%d/30'):format(math.min(row.days, 30)))
-                imgui.SameLine(300)
-                imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), fmtMoney(row.price))
+                imgui.SameLine(leftW*0.60)
+                imgui.TextDisabled(('%d/30'):format(math.min(row.days,30)))
+                imgui.SameLine(leftW*0.77)
+                imgui.TextColored(accent(),fmtMoney(row.price))
                 imgui.PopID()
             end
         end
     imgui.EndChild()
-    imgui.SameLine()
-    imgui.BeginChild('##right', imgui.ImVec2(-1, listH), true)
-        if not selectedName or not prices[selectedName] then
-            imgui.TextDisabled('Выбери машину слева')
-        else
-            local info = prices[selectedName]
-            imgui.PushStyleColor(imgui.Col.Text, accent())
-            imgui.TextWrapped(selectedName)
-            imgui.PopStyleColor()
-            imgui.Text(('Средняя: %s'):format(fmtMoney(info.price or 0)))
-            spaced(0, 6)
-            local prevW = math.floor(imgui.GetContentRegionAvail().x)
-            if prevW < 280 then prevW = 280 end
-            if prevW > 420 then prevW = 420 end
-            carImg.drawPreview(selectedName, prevW * uiScale, uiScale)
-            spaced(0, 4)
-            imgui.Separator()
-            imgui.TextDisabled('Продажи по дням')
-            spaced(0, 4)
-            local days = info.days or {}
-            if #days == 0 then
-                imgui.TextDisabled('Нет данных')
-            else
-                for j = 1, math.min(#days, MAX_DAYS) do
-                    local row = days[j]
-                    imgui.Text(tostring(row.date))
-                    imgui.SameLine(150)
-                    imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1), fmtMoney(row.price))
-                end
-            end
-        end
-    imgui.EndChild()
+
 end
 
 local function drawScan()
+    if scanState.isViceCity() then
+        sectionTitle('Vice City')
+        imgui.TextWrapped('На этом сервере нет системного раздела средних цен. Скрипт автоматически читает таблички в автосалоне и показывает их во вкладке «Цены».')
+        return
+    end
     sectionTitle('Сканирование цен')
     imgui.TextWrapped('Откройте на автобазаре список «Средняя цена автомобилей», затем запустите сканирование.')
     spaced(0, 14)
@@ -5288,7 +7173,7 @@ local function drawSettings()
             scanState.saveSettings()
         end
         imgui.Checkbox('Уведомлять о новых продажах', notifyNewSales)
-        imgui.Checkbox('Средняя цена в техпаспорте', showPassportAvg)
+        imgui.Checkbox(scanState.isViceCity() and 'Цена лота в техпаспорте' or 'Средняя цена в техпаспорте', showPassportAvg)
     elseif settingsTab == 2 then
         sectionTitle('Горячие клавиши')
         if scanState.bindWait then
@@ -5396,6 +7281,9 @@ local function drawDeals()
         end
         local pickedModel = ffi.string(dealModelBuf)
         imgui.SetNextItemWidth(280)
+        if scanState.isViceCity() then
+            imgui.InputTextWithHint('##dealmodelvc', 'Модель транспорта', dealModelBuf, 64)
+        else
         if imgui.BeginCombo('##dealmodel', pickedModel ~= '' and pickedModel or 'модель из базы') then
             if imgui.IsWindowAppearing() then imgui.SetKeyboardFocusHere() end
             imgui.SetNextItemWidth(-1)
@@ -5418,6 +7306,7 @@ local function drawDeals()
                 end
             end
             imgui.EndCombo()
+        end
         end
         imgui.SameLine()
         imgui.SetNextItemWidth(140)
@@ -5459,7 +7348,8 @@ local function drawDeals()
         if actionButton('Купил', imgui.ImVec2(110, 28)) then submitManual('buy') end
         imgui.SameLine()
         if actionButton('Продал', imgui.ImVec2(110, 28)) then submitManual('sell') end
-        imgui.TextDisabled('Модель — из базы средних цен. Если сделки нет в логе — внеси сюда.')
+        imgui.TextDisabled(scanState.isViceCity() and 'Введите модель и цену сделки в VC$.'
+            or 'Модель — из базы средних цен. Если сделки нет в логе — внеси сюда.')
 
         return
     end
@@ -5510,6 +7400,7 @@ end
 
 local PAGE_DRAW = {
     base = drawBase,
+    marketplace = drawMarketplace,
     scan = drawScan,
     deals = drawDeals,
     chat = drawChatPage,
@@ -5938,6 +7829,18 @@ imgui.OnFrame(function()
     end
     return win[0] or chatOn[0] or scanState.active
 end, function(player)
+    local interactive=win[0]
+    if not interactive and chatOn[0] and scanState.mouseBindOn[0] then
+        local vk=tonumber(scanState.mouseVk) or 0x12
+        interactive=isKeyDown(vk) or (vk==0x12 and (isKeyDown(0xA4) or isKeyDown(0xA5)))
+    end
+    player.HideCursor=not interactive
+    player.LockPlayer=false
+    if interactive then
+        rawImgui.DisableInput=false
+        scanState.syncUiMouse(rawImgui.GetIO())
+    end
+end, function(player)
     local sw, sh = getScreenResolution()
     uiScale = math.min(math.max(0.6, math.min(1.2, scanState.uiScale or 1)),
         math.max(0.3, math.min((sw - 32) / WIN_W, (sh - 32) / WIN_H)))
@@ -6060,6 +7963,27 @@ function scanState.ensureNotifications()
     return true
 end
 
+function scanState.syncMarket()
+    if type(sampGetCurrentServerAddress) ~= 'function' then return end
+    local ok, ip = pcall(sampGetCurrentServerAddress)
+    if not ok or not ip or ip == '' or ip == '0.0.0.0' then return end
+    if os.clock() < (scanState.marketCheckAt or 0) then return end
+    scanState.marketCheckAt = os.clock() + 1
+    local profile = scanState.isViceCity() and 'vice' or 'arizona'
+    if not scanState.marketProfile then scanState.marketProfile=profile; return end
+    if scanState.marketProfile == profile then return end
+    saveDealLogs()
+    scanState.marketProfile = profile
+    pendingBuy.reset()
+    pendingSell.details = {}
+    scanState.manualConfirmation = nil
+    scanState.active, scanState.wantScan = false, false
+    passportJob.patch, passportJob.model = nil, nil
+    knownPlates, PLATES = {}, {}
+    loadDealLogs(false)
+    forgetListed()
+end
+
 local CMDS = { 'abarz', 'abscan', 'abchat', 'abprice', 'carprice', 'abupdate' }
 
 local function unregisterCmds()
@@ -6069,17 +7993,22 @@ local function unregisterCmds()
 end
 
 function main()
+    if not scanState.acquireInstance() then
+        print('AutoABarz: duplicate script copy disabled; keep only one ABarz file in moonloader.')
+        thisScript():unload()
+        return
+    end
     while not isSampAvailable() do wait(0) end
     if scanState.ensureNotifications() then return end
     if scanState.ensureEventsLib() then return end
     scanState.loadArizonaEvents()
     loadPrices()
-    -- Сделки из файла — да. «На АБ» из файла — нет: при реконнекте скрипт часто
-    -- перезагружается ещё до onConnectionLost, а сервер лоты уже снял.
-    -- Лоты живут только в памяти текущей сессии скрипта (+ deals.json на дисконнекте чистим).
-    loadDealLogs(false)
-    forgetListed()
+    -- Restore own listings only after a quick reload in the same connected game process.
+    -- Disconnect handlers clear them; a fresh game/server/player identity never reuses them.
+    scanState.marketProfile = scanState.isViceCity() and 'vice' or 'arizona'
+    loadDealLogs('session')
     pcall(scanState.loadSettings)
+    pcall(scanState.cloud.load)
     cleanupCurrencyNames()
     pcall(carImg.loadVehiclesMap, false)
 
@@ -6114,6 +8043,10 @@ function main()
         setChatEnabled(not chatOn[0])
     end)
     local function cmdAbPrice(arg)
+        if scanState.isViceCity() then
+            chat('На Vice City нет системных средних цен. Лоты и их цены доступны в /abarz → Цены.', 'info')
+            return
+        end
         arg = tostring(arg or ''):gsub('^%s+', ''):gsub('%s+$', '')
         if arg == '' then
             chat('Использование: /abprice [название]')
@@ -6174,14 +8107,18 @@ function main()
     end
 
     while true do
+        pcall(scanState.syncPrices)
+        pcall(scanState.syncMarket)
         if scanState.wantScan then
             scanState.wantScan = false
             startScan()
         end
         pcall(scanState.pumpHttpJobs)
+        pcall(scanState.cloud.pump)
         pcall(scanState.pumpLogo)
         pcall(drainHttpCbQueue)
         pcall(pumpSales)
+        pcall(scanState.marketplace.pump)
         pcall(scanState.mark.pump)
         pcall(pumpCefDialog)
         pcall(pumpScanFab)
@@ -6199,12 +8136,14 @@ end
 
 function onScriptTerminate(s)
     if s == thisScript() then
+        if scanState.duplicateInstance then return end
+        pcall(scanState.marketplace.close)
         chatOn[0] = false
         unregisterCmds()
         stopSaleWatch()
         pcall(scanState.mark.release)
         rebuildList()
-        savePrices()
+        if scanState.pricesDirty then savePrices() end
         -- не сохранять лоты, если уже дисконнект / помечен сброс
         if pendingSell.dropListed then
             pendingSell.lots = {}
@@ -6223,5 +8162,6 @@ function onScriptTerminate(s)
                 carImg.releaseSlot(slot)
             end
         end)
+        pcall(scanState.releaseInstance)
     end
 end
