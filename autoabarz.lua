@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.9.5')
+script_version('1.9.6')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -4294,7 +4294,7 @@ function scanState.cloud.pump()
     c.pollReadyAt=os.clock()+0.1
     if #topics==0 then return end
     c.lastPollAt=os.time()
-    c.nextPollAt=c.lastPollAt+30
+    c.nextPollAt=c.lastPollAt+10
     c.send('/v1/poll',{topics=topics},function(body,err,code)
         local ok,data=safeDecodeJson(body or '')
         for index,job in ipairs(jobs) do
@@ -5322,7 +5322,7 @@ end
 -- UI  (во вложенной функции: в чанке Lua 5.1 максимум 200 local)
 ---------------------------------------------------------------------------
 scanState.marketplace = {
-    enabled=true, sharing=true, ttl=300, heartbeat=180, peers={}, generation=0, sequence=0,
+    enabled=true, sharing=true, ttl=300, heartbeat=60, peers={}, viewCaches={}, generation=0, sequence=0,
     nextSend=0, nextPoll=0, status='Ожидание подключения', visibleAt=0,pendingClears={},retired={},
     selectedServer=0,viewGeneration=0,
 }
@@ -5356,10 +5356,12 @@ function scanState.marketplace.bindView()
             currency=m.selectedServer==33 and 'VC$' or '$'}
     end
     if (m.viewCtx and m.viewCtx.key)~=(target and target.key) then
+        if m.viewCtx then m.viewCaches[m.viewCtx.room]={peers=m.peers,cursor=m.cursor,lastPoll=m.lastPoll} end
+        local cached=target and m.viewCaches[target.room]
         m.viewGeneration=m.viewGeneration+1
-        m.peers,m.cursor={},nil
+        m.peers,m.cursor=cached and cached.peers or {},cached and cached.cursor or nil
         m.pollBusy,m.nextPoll,m.pollBlockedUntil=false,0,0
-        m.pollUrgent,m.lastPoll,m.pollFailures=true,nil,0
+        m.pollUrgent,m.lastPoll,m.pollFailures=true,cached and cached.lastPoll or nil,0
         m.status=target and 'Подключение к каталогу' or 'Ожидание подключения'
         m.viewCtx=target
     end
@@ -6106,6 +6108,7 @@ function scanState.marketplace.close()
     m.generation=m.generation+1
     m.ctx,m.session,m.sendBusy,m.pollBusy=nil,nil,false,false
     m.peers,m.cursor={},nil
+    m.viewCaches={}
     m.tuning.cache,m.tuning.attempted,m.tuning.stage,m.tuning.pending,m.tuning.sale,m.tuning.confirm={},{},nil,nil,nil,nil
     m.viewCtx=nil
     m.viewGeneration=m.viewGeneration+1
@@ -6143,15 +6146,16 @@ function scanState.marketplace.poll()
         function(body,err,code)
             if generation~=m.viewGeneration or (m.viewCtx or m.ctx)~=ctx then return end
             m.pollBusy=false
-            m.nextPoll=m.now()+(scanState.cloud.url and 30 or 15)
+            m.nextPoll=m.now()+(scanState.cloud.url and 10 or 15)
             if err or not body or tonumber(code or 200)>=300 then
                 m.pollFailures=math.min(5,(m.pollFailures or 0)+1)
-                m.pollBlockedUntil=m.now()+(tonumber(code)==429 and 120 or math.min(120,5*2^m.pollFailures))
+                m.pollBlockedUntil=m.now()+(tonumber(code)==429 and 120 or math.min(15,3*2^(m.pollFailures-1)))
                 m.status='Каталог временно недоступен. Показаны ещё активные объявления.'
                 return
             end
-            m.pollFailures,m.pollBlockedUntil=0,0
             if #body>8000000 then m.status='Ответ каталога слишком большой'; return end
+            local oldPeers,oldCursor=m.peers,m.cursor
+            if scanState.cloud.url then m.peers={} end
             local count=0
             for line in body:gmatch('[^\r\n]+') do
                 count=count+1
@@ -6160,8 +6164,16 @@ function scanState.marketplace.poll()
                 if #line<=(scanState.cloud.url and 64000 or 16000) then ok,event=safeDecodeJson(line) end
                 if ok and event.event=='message' and event.topic==ctx.topic and type(event.id)=='string'
                     and event.id:match('^[%w_%-]+$') and #event.id<=100 then m.cursor=event.id end
-                m.ingest(line,ctx)
+                local accepted=m.ingest(line,ctx)
+                if scanState.cloud.url and not accepted then
+                    m.peers,m.cursor=oldPeers,oldCursor
+                    m.pollFailures=(m.pollFailures or 0)+1
+                    m.nextPoll=m.now()+3
+                    m.status='Получен неполный каталог. Сохранены предыдущие объявления; повторяю загрузку.'
+                    return
+                end
             end
+            m.pollFailures,m.pollBlockedUntil=0,0
             m.lastPoll=m.now()
             m.status='Каталог обновлён'
             m.prune()
@@ -7266,7 +7278,6 @@ local function drawDeals()
     end
     if dealsTab == 2 then
         sectionTitle('Лоты и подтверждения')
-        local nLots = #(pendingSell.lots or {})
         for _, entry in ipairs(pendingSell.confirmations) do
             if entry.state == 'unresolved' then
                 imgui.PushIDStr(entry.id)
@@ -7294,11 +7305,11 @@ local function drawDeals()
                 imgui.PopID()
             end
         end
+        local nLots = #(pendingSell.lots or {})
         if nLots > 0 then
             imgui.TextColored(imgui.ImVec4(0.45, 0.85, 0.55, 1),
                 ('На АБ  %d'):format(nLots))
-            for i = 1, nLots do
-                local lot = pendingSell.lots[i]
+            for i,lot in ipairs(pendingSell.lots or {}) do
                 imgui.Text(('  %s  ·  %s'):format(
                     (lot.model ~= '' and lot.model) or 'транспорт',
                     fmtMoney(lot.price)))
