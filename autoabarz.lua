@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.9.4')
+script_version('1.9.5')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -4183,7 +4183,7 @@ function scanState.cloud.load()
     c.url=c.validUrl(url) and url or nil
     c.device=nil
     c.generation=c.generation+1
-    c.queue,c.active,c.nextRegister,c.registering,c.nextPollAt={},0,0,false,0
+    c.queue,c.active,c.nextRegister,c.registering,c.nextPollAt,c.lastPollAt={},0,0,false,0,0
     if not c.url then return end
     f=io.open(DATA_DIR..'\\cloudflare-device.json','r')
     if f then
@@ -4197,7 +4197,13 @@ function scanState.cloud.request(method,topic,suffix,body,callback,timeout)
     local c=scanState.cloud
     if method~='GET' and method~='PUT' then queueHttpCb(callback,nil,'ABarz API: неподдерживаемый запрос',0); return end
     if #c.queue>=128 then queueHttpCb(callback,nil,'ABarz API: очередь переполнена',0); return end
+    local m=scanState.marketplace
+    local view=m and (m.viewCtx or m.ctx)
+    local market=method=='GET' and view and topic==view.topic
+    local urgent=market and m.pollUrgent or false
+    if urgent then m.pollUrgent=false end
     c.queue[#c.queue+1]={method=method,topic=topic,body=body or '',callback=callback,
+        marketGeneration=market and m.viewGeneration or nil,urgent=urgent,
         since=tostring(suffix):match('[?&]since=([%w_%-]+)'),untilAt=os.clock()+(tonumber(timeout) or 12)+20}
     c.pollReadyAt=c.pollReadyAt or (os.clock()+0.1)
 end
@@ -4256,7 +4262,9 @@ function scanState.cloud.pump()
     if not c.url then return end
     local waiting={}
     for _,job in ipairs(c.queue) do
-        if os.clock()>job.untilAt then queueHttpCb(job.callback,nil,c.errorText or 'ABarz API: timeout',0)
+        if job.marketGeneration~=nil and job.marketGeneration~=scanState.marketplace.viewGeneration then
+            queueHttpCb(job.callback,nil,'Каталог переключён',0)
+        elseif os.clock()>job.untilAt then queueHttpCb(job.callback,nil,c.errorText or 'ABarz API: timeout',0)
         else waiting[#waiting+1]=job end
     end
     c.queue=waiting
@@ -4272,7 +4280,10 @@ function scanState.cloud.pump()
             queueHttpCb(job.callback,body,err,code)
         end)
     end
-    if c.active>=3 or os.clock()<(c.pollReadyAt or 0) or os.time()<(c.nextPollAt or 0) then return end
+    local urgent=false
+    for _,job in ipairs(c.queue) do if job.method=='GET' and job.urgent then urgent=true; break end end
+    local readyAt=urgent and (c.lastPollAt or 0)+2 or (c.nextPollAt or 0)
+    if c.active>=3 or os.clock()<(c.pollReadyAt or 0) or os.time()<readyAt then return end
     local topics,jobs,remaining={},{},{}
     for _,job in ipairs(c.queue) do
         if job.method=='GET' and #topics<2 then
@@ -4282,7 +4293,8 @@ function scanState.cloud.pump()
     c.queue=remaining
     c.pollReadyAt=os.clock()+0.1
     if #topics==0 then return end
-    c.nextPollAt=os.time()+30
+    c.lastPollAt=os.time()
+    c.nextPollAt=c.lastPollAt+30
     c.send('/v1/poll',{topics=topics},function(body,err,code)
         local ok,data=safeDecodeJson(body or '')
         for index,job in ipairs(jobs) do
@@ -5347,6 +5359,7 @@ function scanState.marketplace.bindView()
         m.viewGeneration=m.viewGeneration+1
         m.peers,m.cursor={},nil
         m.pollBusy,m.nextPoll,m.pollBlockedUntil=false,0,0
+        m.pollUrgent,m.lastPoll,m.pollFailures=true,nil,0
         m.status=target and 'Подключение к каталогу' or 'Ожидание подключения'
         m.viewCtx=target
     end
@@ -5360,6 +5373,20 @@ function scanState.marketplace.selectServer(index)
     m.selectedServer=index
     m.bindView()
     return true
+end
+
+function scanState.marketplace.refresh()
+    local m=scanState.marketplace
+    m.nextPoll,m.pollBlockedUntil,m.pollFailures=0,0,0
+    m.pollUrgent=true
+    local view=m.viewCtx or m.ctx
+    if view then
+        for _,job in ipairs(scanState.cloud.queue) do
+            if job.method=='GET' and job.topic==view.topic and job.marketGeneration==m.viewGeneration then
+                job.urgent=true; m.pollUrgent=false
+            end
+        end
+    end
 end
 
 function scanState.marketplace.currentVehicle()
@@ -6849,6 +6876,7 @@ local function drawMarketplaceContent()
             local title=index==0 and ('Текущий сервер · '..m.roomLabel(m.ctx and m.ctx.room)) or m.serverLabel(index)
             if imgui.Selectable(title,m.selectedServer==index) then
                 m.selectServer(index)
+                marketOwn[0]=false
                 marketSelected=nil
                 scanState.saveSettings()
             end
@@ -6857,7 +6885,8 @@ local function drawMarketplaceContent()
     end
     imgui.SameLine()
     view=m.viewCtx
-    if imgui.SmallButton('Обновить каталог') then m.nextPoll=m.now() end
+    if imgui.SmallButton('Обновить каталог') then m.refresh() end
+    if m.pollBusy or (not m.lastPoll and (m.pollFailures or 0)==0) then imgui.TextDisabled('Загружаю каталог выбранного сервера…') end
     if m.publishError then imgui.TextWrapped(m.publishError) end
     if (m.pollFailures or 0)>0 then imgui.TextWrapped(m.status) end
     if not view then
