@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.9.2')
+script_version('1.9.3')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -186,7 +186,7 @@ local waitPageMs = new.int(0)
 local notifyNewSales = new.bool(true)
 local showPassportAvg = new.bool(true)
 local MAX_DAYS = 30
-local MAX_PAGES_SAFETY = 40
+local MAX_PAGES_SAFETY = 1000
 local DIALOG_LIST_ID = 15376
 local DIALOG_DAYS_ID = 15377
 local DIALOG_PASSPORT_ID = 25218
@@ -1403,12 +1403,14 @@ end
 
 local function navKind(plain)
     plain = tostring(plain or '')
-    -- Lua string.lower не трогает кириллицу — ищем как есть
-    if plain:find('оиск по названию', 1, true) then return 'search' end
-    if plain:find('редыдущая страница', 1, true) then return 'prev' end
-    if plain:find('ледующая страница', 1, true) then return 'next' end
-    if plain:find('ранспорт', 1, true) and plain:find('30', 1, true) then return 'header' end
-    if plain:find('ата', 1, true) and plain:find('родаж', 1, true) then return 'header' end
+    local upper,lower='АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ','абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+    plain=plain:lower()
+    for i=1,#upper,2 do plain=plain:gsub(upper:sub(i,i+1),lower:sub(i,i+1)) end
+    if plain:find('поиск по названию', 1, true) then return 'search' end
+    if plain:find('предыдущая страница',1,true) or plain:find('пред. страница',1,true) then return 'prev' end
+    if plain:find('следующая страница',1,true) or plain:find('след. страница',1,true) then return 'next' end
+    if plain:find('транспорт', 1, true) and plain:find('30', 1, true) then return 'header' end
+    if plain:find('дата', 1, true) and plain:find('продаж', 1, true) then return 'header' end
     return nil
 end
 
@@ -1520,8 +1522,8 @@ local function ingestDialog(id, style, title, btn1, btn2, text)
         kind = kind,
         seq = scanState.dlgSeq,
         cars = cars,
-        nextIdx = nextIdx or 2,
-        prevIdx = prevIdx or 1,
+        nextIdx = nextIdx,
+        prevIdx = prevIdx,
     }
     if not scanState.active then
         rebuildList()
@@ -1642,10 +1644,6 @@ local function backToList(timeoutMs)
     return haveList()
 end
 
-local function namesEqual(a, b)
-    return normalizeName(a or '') == normalizeName(b or '') and normalizeName(a or '') ~= ''
-end
-
 -- Открыть дни: один клик по корректному listitem.
 local function openCarDays(listId, car, nextIdx, prevIdx)
     nextIdx = nextIdx or 2
@@ -1668,9 +1666,15 @@ local function openCarDays(listId, car, nextIdx, prevIdx)
     return nil, nil
 end
 
-local function goNextPage(listId, nextIdx, oldFirst)
-    nextIdx = nextIdx or 2
-    for attempt = 1, 3 do
+function scanState.scanPageKey(cars)
+    local names={}
+    for _,car in ipairs(cars or {}) do names[#names+1]=normalizeName(car.name) end
+    return table.concat(names,'\1')
+end
+
+local function goNextPage(listId, nextIdx, oldPage)
+    if nextIdx==nil then return nil end
+    for attempt = 1, 2 do
         if scanState.dlg and scanState.dlg.kind == 'days' then
             if not backToList(500) then return nil end
         end
@@ -1678,12 +1682,13 @@ local function goNextPage(listId, nextIdx, oldFirst)
             if not backToList(500) then return nil end
         end
         listId = (scanState.dlg and scanState.dlg.id > 0) and scanState.dlg.id or listId
-        nextIdx = (scanState.dlg and scanState.dlg.nextIdx) or nextIdx
+        nextIdx = scanState.dlg.nextIdx
+        if nextIdx==nil then return nil end
         local seqBefore = scanState.dlgSeq or 0
         dialogResponse(listId, 1, nextIdx, '')
         clickDelay()
 
-        local deadline = os.clock() + 0.7
+        local deadline = os.clock() + 3
         while os.clock() < deadline and scanState.active do
             pcall(drainScanDialogs)
             local d = scanState.dlg
@@ -1692,10 +1697,7 @@ local function goNextPage(listId, nextIdx, oldFirst)
                 break
             end
             if d and d.kind == 'list' and d.cars and d.cars[1] then
-                if (tonumber(d.seq) or 0) > seqBefore and not namesEqual(d.cars[1].name, oldFirst) then
-                    return d
-                end
-                if not namesEqual(d.cars[1].name, oldFirst) then
+                if (tonumber(d.seq) or 0) > seqBefore and scanState.scanPageKey(d.cars)~=oldPage then
                     return d
                 end
             end
@@ -1746,7 +1748,7 @@ local function startScan()
     lua_thread.create(function()
         local function current() return scanState.scanEpoch==epoch end
         local page = 0
-        local seenFirst = {}
+        local seenPages = {}
 
         while current() and scanState.active and page < MAX_PAGES_SAFETY do
             local list = scanState.dlg
@@ -1767,14 +1769,14 @@ local function startScan()
             local listId = (list.id and list.id > 0) and list.id or DIALOG_LIST_ID
             local nextIdx = list.nextIdx or 2
             local prevIdx = list.prevIdx or 1
-            local firstName = pageCars[1] and pageCars[1].name or ''
+            local pageKey = scanState.scanPageKey(pageCars)
             page = page + 1
             scanState.index = page
 
-            if firstName ~= '' and seenFirst[firstName] then
+            if pageKey~='' and seenPages[pageKey] then
                 break
             end
-            if firstName ~= '' then seenFirst[firstName] = true end
+            if pageKey~='' then seenPages[pageKey] = true end
 
             if #pageCars == 0 then
                 break
@@ -1827,9 +1829,11 @@ local function startScan()
             end
 
             listId = scanState.dlg.id > 0 and scanState.dlg.id or listId
-            nextIdx = scanState.dlg.nextIdx or 2
-            local nxt = goNextPage(listId, nextIdx, firstName)
+            nextIdx = scanState.dlg.nextIdx
+            if nextIdx==nil then break end
+            local nxt = goNextPage(listId, nextIdx, pageKey)
             if not nxt then
+                if scanState.active then chat('Следующая страница не получена. Уже считанные цены сохранены; скан можно повторить.','warning') end
                 break
             end
         end
