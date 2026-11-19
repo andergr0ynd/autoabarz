@@ -5342,7 +5342,8 @@ function scanState.marketplace.tuning.store(id,model,data)
     if not ctx or not data or not id or not scanState.mark.validModel(model) then return false end
     local snapshot={id=id,model=model,data=data,at=m.now(),room=ctx.room,handle=m.tuning.handle(id)}
     m.tuning.cache[ctx.room..'/'..id]=snapshot
-    if m.tuning.sale and m.tuning.sale.phase=='reading' and m.tuning.sale.vehicle==id and m.tuning.sale.room==ctx.room then
+    if m.tuning.sale and (m.tuning.sale.phase=='opening' or m.tuning.sale.phase=='reading')
+        and m.tuning.sale.vehicle==id and m.tuning.sale.room==ctx.room then
         m.tuning.sale.received=true
     end
     for _,lot in ipairs(pendingSell.lots) do
@@ -5405,7 +5406,7 @@ function scanState.marketplace.tuning.finishSale(resume,reason)
     local t=scanState.marketplace.tuning
     local sale=t.sale
     if not sale then return end
-    t.sale,t.pending,t.confirm=nil,nil,nil
+    t.sale,t.pending,t.confirm,t.stage=nil,nil,nil,nil
     local ctx=scanState.marketplace.context()
     if sale.opened and ctx and ctx.key==sale.context then
         t.eval("window.executeEvent('event.inventory.setPlayerInventoryVisible','[false]');window.executeEvent('event.setActiveView','[null]');if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('onActiveViewChanged|null',0);}")
@@ -5489,7 +5490,6 @@ function scanState.marketplace.tuning.cef(packet)
         elseif type(doc[1])=='boolean' then t.inventoryVisible=doc[1] end
         return
     end
-    if t.sale and t.sale.phase=='opening' then return end
     local id=m.currentVehicle()
     local ctx=m.context()
     if not id or not ctx then t.stage=nil; return end
@@ -5501,6 +5501,8 @@ function scanState.marketplace.tuning.cef(packet)
         if doc[1]=='vehicle' and stage and stage.id==id and stage.room==ctx.room and m.now()-stage.at<=10
             and stage.model and stage.data.t and stage.data.v then
             t.store(id,stage.model,stage.data); t.stage=nil
+        elseif doc[1]~='vehicle' then
+            t.stage=nil
         end
         return
     end
@@ -6679,6 +6681,29 @@ local function marketValue(label,value,color,scale)
     imgui.SetWindowFontScale(1.0)
 end
 
+local function drawMarketTuning(selected)
+    local count=0
+    if selected.tuning then
+        for _,items in pairs(selected.tuning) do count=count+#items end
+    end
+    local title=count>0 and ('Установленный тюнинг · %d'):format(count) or 'Установленный тюнинг'
+    if not imgui.CollapsingHeader(title..'###tuning-'..tostring(selected.key or selected.id)) then return end
+    if selected.tuning then
+        for _,group in ipairs({{'t','Технический'},{'v','Визуальный'},{'p','Винил'},{'m','Модификация'},{'n','Номер'}}) do
+            local items=selected.tuning[group[1]]
+            if items and #items>0 then
+                imgui.Text(group[2])
+                for _,name in ipairs(items) do imgui.TextWrapped('• '..name) end
+                spaced(0,4)
+            end
+        end
+        if count==0 then imgui.TextDisabled('В считанных разделах деталей нет') end
+    else
+        imgui.TextWrapped(selected.tuningOmitted and 'Полный список деталей не передан: превышен размер объявления.'
+            or 'Тюнинг ещё не считан продавцом.')
+    end
+end
+
 local function drawMarketplaceContent()
     local m=scanState.marketplace
     m.visibleAt=m.now()
@@ -6815,23 +6840,7 @@ local function drawMarketplaceContent()
             spaced(0,8)
             imgui.Separator()
             spaced(0,8)
-            imgui.TextDisabled('Установленный тюнинг')
-            if selected.tuning then
-                local count=0
-                for _,group in ipairs({{'t','Технический'},{'v','Визуальный'},{'p','Винил'},{'m','Модификация'},{'n','Номер'}}) do
-                    local items=selected.tuning[group[1]]
-                    if items and #items>0 then
-                        count=count+#items
-                        imgui.Text(group[2])
-                        for _,name in ipairs(items) do imgui.TextWrapped('• '..name) end
-                        spaced(0,4)
-                    end
-                end
-                if count==0 then imgui.TextDisabled('В считанных разделах деталей нет') end
-            else
-                imgui.TextWrapped(selected.tuningOmitted and 'Полный список деталей не передан: превышен размер объявления.'
-                    or 'Тюнинг ещё не считан продавцом.')
-            end
+            drawMarketTuning(selected)
             local vehicle=selected.own and m.vehicleIdentity({marketKey=selected.id})
             if selected.own then
                 for _,lot in ipairs(pendingSell.lots) do if lot.id==selected.id then vehicle=m.vehicleIdentity(lot); break end end
