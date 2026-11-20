@@ -17,7 +17,7 @@
 
 Нужны MoonLoader, mimgui и effil.
 
-Готовые архивы в разделе Releases содержат библиотеки в структуре MoonLoader. Скопируйте их папку `lib` в `moonloader/lib`:
+Для ручной установки скопируйте папку `lib` из этого репозитория в `moonloader/lib`:
 
 ```text
 lib/
