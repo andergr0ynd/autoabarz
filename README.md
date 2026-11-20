@@ -17,6 +17,23 @@
 
 Нужны MoonLoader, mimgui и effil.
 
+Готовые архивы в разделе Releases содержат библиотеки в структуре MoonLoader. Скопируйте их папку `lib` в `moonloader/lib`:
+
+```text
+lib/
+  notifications.lua
+  arizona-cef-dialogs.lua
+  arizona-events/
+    init.lua
+    core.lua
+    bitstream.lua
+    subprocess.lua
+```
+
+Если скачиваете только Lua-файл скрипта, дополнительно установите `lib/arizona-cef-dialogs.lua` из этого репозитория: в версии 1.9.6 она не скачивается автоматически. mimgui, effil и стандартные библиотеки MoonLoader устанавливаются отдельно. Заголовок с авторством XRLM в arizona-cef-dialogs сохранён.
+
+Папка `arizona-events/` в корне репозитория оставлена для совместимости с загрузчиками выпущенных скриптов. Её содержимое совпадает с `lib/arizona-events/`; для ручной установки используйте структуру `lib` выше.
+
 ## Команды
 
 - `/abarz` — меню
@@ -48,6 +65,8 @@
 - `autoabarz.lua` — скрипт
 - `abarz1.4.lua` — версия без автообновления скрипта
 - `lib/notifications.lua` — библиотека уведомлений
+- `lib/arizona-cef-dialogs.lua` — работа с диалогами CEF
+- `lib/arizona-events/` — библиотека событий Arizona в готовой структуре установки
 - `version.json` — номер версии для автообновления
 - `CHANGELOG.md` — текст изменений для форума
 - `images/abarz-logo.png` — логотип в левом верхнем углу меню
