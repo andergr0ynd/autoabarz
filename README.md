@@ -3,9 +3,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/autoabarz.lua"><img src="images/download-auto.svg" width="285" alt="Скачать AutoABarz — с обновлением скрипта"></a>
+  <a href="https://github.com/andergr0ynd/autoabarz/releases/latest/download/autoabarz.lua"><img src="images/download-auto.svg" width="285" alt="Скачать AutoABarz — с обновлением скрипта"></a>
   &nbsp;
-  <a href="https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/abarz1.5.lua"><img src="images/download-manual.svg" width="285" alt="Скачать ABarz 1.5 — без обновления скрипта"></a>
+  <a href="https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.5.lua"><img src="images/download-manual.svg" width="285" alt="Скачать ABarz 1.5 — без обновления скрипта"></a>
+  &nbsp;
+  <a href="https://www.blast.hk/threads/257682/"><img src="images/download-blast.svg" width="285" alt="Скачать с Blast.hk — открыть тему ABarz на форуме"></a>
 </p>
 
 <p align="center">
@@ -28,7 +30,7 @@
 
 | | **AutoABarz** | **ABarz 1.5** |
 | :--- | :--- | :--- |
-| Файл | [**autoabarz.lua**](https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/autoabarz.lua) | [**abarz1.5.lua**](https://github.com/andergr0ynd/autoabarz/raw/refs/heads/main/abarz1.5.lua) |
+| Файл | [**autoabarz.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/autoabarz.lua) | [**abarz1.5.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.5.lua) |
 | Возможности | Все функции ABarz | Те же функции |
 | Обновление самого скрипта | Проверка GitHub и загрузка новой версии | Замена файла вручную |
 | Загрузка библиотек ABarz | Автоматически | Автоматически |
@@ -51,7 +53,7 @@ Arizona RP/
     └── autoabarz.lua        ← или abarz1.5.lua, только один файл
 ```
 
-Если браузер открыл исходный код, нажми **Ctrl+S** и сохрани файл с расширением `.lua`.
+Кнопки GitHub скачивают готовый `.lua`-файл. Кнопка **«Скачать с Blast.hk»** открывает тему ABarz на форуме, где можно скачать опубликованные там файлы.
 
 **3. Зайди в игру и введи `/abarz`.** При первом запуске скрипт скачает недостающие библиотеки ABarz и один раз перезапустится. Дождись завершения загрузки.
 
