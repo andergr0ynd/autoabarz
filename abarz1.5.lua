@@ -5,7 +5,7 @@
 
 script_name('ABarz')
 script_author('pechkin')
-script_version('1.9.6')
+script_version('1.9.7')
 script_description('Автобазар Arizona: цены, продажи, сделки, маркетплейс')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -7329,88 +7329,107 @@ local PAGE_DRAW = {
 
 scanState.forumUrl = 'https://www.blast.hk/threads/257682/#post-1695478'
 scanState.logoUrl = 'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/images/abarz-logo.png'
-scanState.eventsLibBase = {
-    'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/arizona-events/',
-    'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/arizona-events/',
-}
-scanState.eventsLibFiles = {
-    { 'init.lua', '' },
-    { 'subprocess.lua', '' },
-    { 'core.lua', 'bad packet size' },
-    { 'bitstream.lua', 'oversized string' },
+scanState.libraryFiles = {
+    {name='notifications.lua',marker='return notifications',minSize=1000,preserveExisting=true},
+    {name='arizona-cef-dialogs.lua',marker='return M',minSize=1000},
+    {name='arizona-events/init.lua',marker='arizona-events.core',minSize=32},
+    {name='arizona-events/subprocess.lua',marker='return subprocess',minSize=32},
+    {name='arizona-events/core.lua',marker='bad packet size',minSize=32},
+    {name='arizona-events/bitstream.lua',marker='oversized string',minSize=32},
 }
 
-function scanState.eventsLibPath(name)
-    return getWorkingDirectory() .. '\\lib\\arizona-events\\' .. name
+function scanState.libraryStatus(text)
+    if ntfy and type(ntfy.show)=='function' then chat(text); return end
+    sampAddChatMessage('{5B8CFF}[ABarz] {FFFFFF}'..d(text),-1)
 end
 
-function scanState.eventsLibOk(name, marker)
-    local f = io.open(scanState.eventsLibPath(name), 'rb')
+function scanState.libraryFileOk(path,entry)
+    local f=io.open(path,'rb')
     if not f then return false end
-    local s = f:read('*a') or ''
-    f:close()
-    if #s < 32 then return false end
-    local head = s:sub(1, 64):lower()
-    if head:find('<!doctype', 1, true) or head:find('<html', 1, true) then return false end
-    if marker and marker ~= '' and not s:find(marker, 1, true) then return false end
-    return true
+    local body=f:read(1048577) or ''; f:close()
+    if #body<(entry.minSize or 32) or #body>1048576 then return false end
+    if body:sub(1,96):lower():find('<html',1,true) or body:sub(1,96):lower():find('<!doctype',1,true) then return false end
+    if entry.marker and not body:find(entry.marker,1,true) then return false end
+    local ok,compiled=pcall(loadfile,path)
+    return ok and type(compiled)=='function'
 end
 
-function scanState.downloadLibFile(name)
-    ensureDir(getWorkingDirectory() .. '\\lib')
-    ensureDir(getWorkingDirectory() .. '\\lib\\arizona-events')
-    local path = scanState.eventsLibPath(name)
-    if type(downloadUrlToFile) ~= 'function' then return false end
-    local ml = require('moonloader')
-    local ds = ml and ml.download_status
-    if not ds then return false end
-    local bases = scanState.eventsLibBase
-    for i = 1, #bases do
-        pcall(os.remove, path)
-        local done, success = false, false
-        local url = bases[i] .. name .. '?t=' .. tostring(os.time())
-        pcall(downloadUrlToFile, url, path, function(_, status)
-            if status == ds.STATUS_ENDDOWNLOADDATA or status == ds.STATUSEX_ENDDOWNLOAD then
-                done = true
-                success = true
-            end
+function scanState.installLibrary(entry)
+    local path=getWorkingDirectory()..'\\lib\\'..entry.name:gsub('/','\\')
+    ensureDir(getWorkingDirectory()..'\\lib')
+    if entry.name:find('/',1,true) then ensureDir(getWorkingDirectory()..'\\lib\\arizona-events') end
+    local okMoon,moon=pcall(require,'moonloader')
+    if not okMoon then okMoon,moon=pcall(require,'lib.moonloader') end
+    local ds=okMoon and moon.download_status
+    if not ds or type(downloadUrlToFile)~='function' then return false end
+    local bases={
+        'https://raw.githubusercontent.com/andergr0ynd/autoabarz/refs/heads/main/lib/',
+        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/lib/',
+    }
+    for _,base in ipairs(bases) do
+        local part=path..'.'..os.time()..'.'..math.random(100000,999999)..'.part'
+        local job={done=false,success=false,accepting=true}
+        local started=pcall(downloadUrlToFile,base..entry.name,part,function(_,state)
+            if not job.accepting then pcall(os.remove,part); return end
+            if state==ds.STATUS_ENDDOWNLOADDATA or state==ds.STATUSEX_ENDDOWNLOAD then
+                job.done,job.success=true,true
+            elseif state==ds.STATUS_ERROR or state==ds.STATUSEX_ERROR then job.done=true end
         end)
-        local t0 = os.clock()
-        while not done and os.clock() - t0 < 25 do wait(50) end
-        if success and scanState.eventsLibOk(name, '') then return true end
-        pcall(os.remove, path)
+        local elapsed=0
+        while started and not job.done and elapsed<15000 do wait(50); elapsed=elapsed+50 end
+        job.accepting=false
+        local installed=false
+        if job.success and scanState.libraryFileOk(part,entry) then
+            if scanState.libraryFileOk(path,entry) then installed=true
+            elseif entry.preserveExisting and doesFileExist(path) then installed=true
+            else
+                local backup=part..'.old'
+                local hadOld=doesFileExist(path)
+                local moved=not hadOld or os.rename(path,backup)~=nil
+                if moved then
+                    installed=os.rename(part,path)~=nil
+                    if not installed and hadOld then os.rename(backup,path) end
+                    if installed and hadOld then pcall(os.remove,backup) end
+                end
+            end
+        end
+        pcall(os.remove,part)
+        if installed then return true end
     end
     return false
 end
 
-function scanState.ensureEventsLib()
-    local files = scanState.eventsLibFiles
-    local need = false
-    for i = 1, #files do
-        if not scanState.eventsLibOk(files[i][1], files[i][2]) then
-            need = true
-            break
-        end
-    end
-    if not need then return false end
-    chat('Качаю arizona-events с GitHub AutoABarz…')
-    local okAll = true
-    for i = 1, #files do
-        local name, marker = files[i][1], files[i][2]
-        if not scanState.eventsLibOk(name, marker) then
-            if not scanState.downloadLibFile(name) or not scanState.eventsLibOk(name, marker) then
-                okAll = false
+function scanState.ensureLibraries(only)
+    local changed=false
+    for _,entry in ipairs(scanState.libraryFiles) do
+        if not only or only[entry.name] then
+            local path=getWorkingDirectory()..'\\lib\\'..entry.name:gsub('/','\\')
+            local loaded=entry.name=='notifications.lua' and ntfy and type(ntfy.show)=='function' and type(ntfy.sale)=='function'
+            local present=loaded or scanState.libraryFileOk(path,entry)
+            if not present and entry.preserveExisting and doesFileExist(path) then
+                scanState.libraryStatus('Не удалось загрузить '..entry.name..'. Проверьте её зависимости в moonloader.log.')
+                present=true
+            end
+            if not present then
+                scanState.libraryStatus('Качаю библиотеку '..entry.name..', пожалуйста, подождите…')
+                if scanState.installLibrary(entry) then changed=true
+                else
+                    scanState.libraryStatus('Не удалось скачать '..entry.name..'. Проверьте интернет и перезагрузите скрипт.')
+                    break
+                end
             end
         end
     end
-    if not okAll then
-        chat('Не удалось скачать arizona-events. CEF будет ограничен.', 'error')
-        return false
+    if changed then
+        scanState.libraryStatus('Библиотеки установлены. Перезапускаю скрипт…')
+        wait(300); thisScript():reload()
+        return true
     end
-    chat('Библиотеки обновлены. Перезапуск скрипта…', 'success')
-    wait(300)
-    thisScript():reload()
-    return true
+    return false
+end
+
+function scanState.ensureNotifications()
+    return scanState.ensureLibraries({['notifications.lua']=true})
 end
 
 function scanState.loadArizonaEvents()
@@ -7813,71 +7832,6 @@ end
 setupUi()
 
 
--- Install the optional UI library once; this does not update the script itself.
-function scanState.ensureNotifications()
-    if ntfy and type(ntfy.show) == 'function' and type(ntfy.sale) == 'function' then return false end
-    local function status(text)
-        sampAddChatMessage('{5B8CFF}[ABarz] {FFFFFF}' .. d(text), -1)
-    end
-    local path = getWorkingDirectory() .. '\\lib\\notifications.lua'
-    if doesFileExist(path) then
-        status('Не удалось загрузить notifications.lua. Проверьте её зависимости в moonloader.log.')
-        return false
-    end
-    status('Качаю библиотеку уведомлений, пожалуйста, подождите…')
-    ensureDir(getWorkingDirectory() .. '\\lib')
-    local okMoon, moon = pcall(require, 'moonloader')
-    if not okMoon then okMoon, moon = pcall(require, 'lib.moonloader') end
-    local ds = okMoon and moon.download_status
-    if type(downloadUrlToFile) ~= 'function' or not ds then
-        status('Не удалось скачать библиотеку уведомлений. Установите lib/notifications.lua вручную.')
-        return false
-    end
-    local urls = {
-        'https://raw.githubusercontent.com/andergr0ynd/autoabarz/main/lib/notifications.lua',
-        'https://cdn.jsdelivr.net/gh/andergr0ynd/autoabarz@main/lib/notifications.lua',
-    }
-    local installed = false
-    for i, url in ipairs(urls) do
-        local part = path .. '.' .. tostring(os.time()) .. '.' .. tostring(math.random(100000,999999)) .. '.part'
-        local job = {done=false, success=false}
-        local started, err = pcall(downloadUrlToFile, url, part, function(_, state)
-            if state == ds.STATUS_ENDDOWNLOADDATA or state == ds.STATUSEX_ENDDOWNLOAD then
-                job.success, job.done = true, true
-            elseif state == ds.STATUS_ERROR or state == ds.STATUSEX_ERROR then
-                job.done = true
-            end
-        end)
-        if not started then print('ABarz notifications download: ' .. tostring(err)) end
-        local elapsed = 0
-        while started and not job.done and elapsed < 25000 do
-            wait(50)
-            elapsed = elapsed + 50
-        end
-        if job.success then
-            local f = io.open(part, 'rb')
-            local body = f and f:read('*a') or ''
-            if f then f:close() end
-            local compiled = loadfile(part)
-            if compiled and #body > 1000 and body:find('return notifications',1,true) then
-                -- Another instance may have installed it while this request was running.
-                installed = doesFileExist(path) or os.rename(part, path) ~= nil
-            end
-        end
-        pcall(os.remove, part)
-        if installed then break end
-    end
-    if not installed then
-        status('Не удалось скачать библиотеку уведомлений. Установите lib/notifications.lua вручную.')
-        return false
-    end
-    status('Библиотека уведомлений установлена. Перезапускаю скрипт…')
-    -- Register notification fonts before mimgui initializes on the next load.
-    wait(300)
-    thisScript():reload()
-    return true
-end
-
 function scanState.syncMarket()
     if type(sampGetCurrentServerAddress) ~= 'function' then return end
     local ok, ip = pcall(sampGetCurrentServerAddress)
@@ -7914,8 +7868,7 @@ function main()
         return
     end
     while not isSampAvailable() do wait(0) end
-    if scanState.ensureNotifications() then return end
-    if scanState.ensureEventsLib() then return end
+    if scanState.ensureLibraries() then return end
     scanState.loadArizonaEvents()
     loadPrices()
     -- Restore own listings only after a quick reload in the same connected game process.
@@ -7924,6 +7877,7 @@ function main()
     loadDealLogs('session')
     pcall(scanState.loadSettings)
     pcall(scanState.cloud.load)
+    scanState.startupReady=true
     cleanupCurrencyNames()
     pcall(carImg.loadVehiclesMap, false)
 
@@ -8030,6 +7984,7 @@ end
 function onScriptTerminate(s)
     if s == thisScript() then
         if scanState.duplicateInstance then return end
+        if not scanState.startupReady then pcall(scanState.releaseInstance); return end
         pcall(scanState.marketplace.close)
         chatOn[0] = false
         unregisterCmds()
