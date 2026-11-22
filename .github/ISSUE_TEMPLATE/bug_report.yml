@@ -13,7 +13,7 @@ body:
       label: Сборка
       options:
         - autoabarz.lua — с обновлением
-        - abarz1.5.lua — без обновления
+        - abarz1.6.lua — без обновления
     validations:
       required: true
   - type: input

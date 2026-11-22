@@ -7,3 +7,6 @@ node_modules/
 .dev.vars
 .env
 cloudflare-device.json
+
+# Local release attachments
+packages/

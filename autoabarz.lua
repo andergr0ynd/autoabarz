@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.9.8')
+script_version('1.9.9')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -889,6 +889,7 @@ local function saveDealLogs()
                 marketTurbo=lot.marketTurbo,marketMileage=lot.marketMileage,
                 marketTurboKnown=lot.marketTurboKnown,
                 marketTuning=lot.marketTuning,
+                marketQuality=lot.marketQuality,
                 marketChatConfirmed=lot.marketChatConfirmed,marketRestoreUntil=lot.marketRestoreUntil,
                 marketVehicleId=lot.marketVehicleId,marketSuppressed=lot.marketSuppressed,
             }
@@ -945,6 +946,7 @@ local function ingestListedRow(row,verifiedSession)
         marketTurbo=row.marketTurbo==true or nil,marketMileage=tonumber(row.marketMileage),
         marketTurboKnown=row.marketTurboKnown==true or row.marketTurbo==true or nil,
         marketTuning=scanState.marketplace.tuning.clean(row.marketTuning),
+        marketQuality=scanState.marketplace.quality.clean(row.marketQuality),
         marketChatConfirmed=row.marketChatConfirmed==true or nil,marketRestoreUntil=tonumber(row.marketRestoreUntil),
         marketVehicleId=tonumber(row.marketVehicleId),marketSuppressed=row.marketSuppressed==true or nil,
     }
@@ -2251,9 +2253,6 @@ local function parseSalePlate(text)
     elseif text:find('Владеле', 1, true) or text:find('Состояние:', 1, true) then
         model, priceStr = text:match('^([^\n]+)\n([^\n]+)')
     end
-    if not model then
-        model, priceStr = text:match('([^\n]+)\t+:CASH:([^\n]+)')
-    end
     if not model or not scanState.mark.validModel(model) then return nil end
     model = normalizeName(model)
     if model == '' or not priceStr then return nil end
@@ -2736,7 +2735,9 @@ function pendingSell.addLot(model, price, source)
                     lot.model,lot.price,lot.t,lot.at=pendingSell.preferName(lot.model,model),price,os.clock(),os.time()
                     lot.marketSuppressed,lot.marketRestoreUntil=nil,nil
                     lot.marketChatConfirmed=true
+                    lot.marketNeedsChat=nil
                     lot.marketVehicleId=vehicle
+                    scanState.marketplace.quality.request(lot)
                     saveDealLogs(); return true
                 end
             end
@@ -2744,6 +2745,8 @@ function pendingSell.addLot(model, price, source)
         local candidate
         for _,lot in ipairs(pendingSell.lots) do
             if ((lot.source=='market-plate' and not lot.marketChatConfirmed) or lot.marketNeedsChat) and lot.price==price
+                and (not vehicle or not scanState.marketplace.vehicleIdentity(lot)
+                    or scanState.marketplace.vehicleIdentity(lot)==tostring(vehicle))
                 and os.clock()-(lot.marketChangedAt or lot.t or 0)<10 and pendingSell.sameModel(lot.model,model) then
                 if candidate then candidate=nil; break end
                 candidate=lot
@@ -2753,6 +2756,7 @@ function pendingSell.addLot(model, price, source)
             candidate.marketChatConfirmed=true; candidate.marketNeedsChat=nil
             candidate.marketVehicleId=vehicle or candidate.marketVehicleId
             candidate.marketSuppressed=nil
+            scanState.marketplace.quality.request(candidate)
             saveDealLogs(); return true
         end
     end
@@ -2760,6 +2764,7 @@ function pendingSell.addLot(model, price, source)
     pendingSell.lots[#pendingSell.lots+1] = {id=pendingSell.newId('lot'), model=model,price=price,
         t=os.clock(),at=os.time(),source=tostring(source or 'chat'),
         marketVehicleId=source=='chat' and scanState.marketplace and scanState.marketplace.currentVehicle() or nil}
+    if source=='chat' then scanState.marketplace.quality.request(pendingSell.lots[#pendingSell.lots]) end
     saveDealLogs()
     return true
 end
@@ -3144,10 +3149,19 @@ end
 onNewSalePlate = function(key, text, minPrice, x, y, z, sampId)
     if not saleAlive then return end
     local fromSign = sampId and scanState.mark.isSign(sampId) or false
+    -- Text on arbitrary world objects is not an offer, even when it contains money.
+    -- Wait for a confirmed sign if its create RPC has not arrived yet.
+    if sampId and not fromSign then
+        if not scanState.mark.objects[sampId] and not scanState.mark.objectHandle(sampId)
+            and scanState.mark.looksLikePlate(text) then
+            scanState.mark.holdShort(sampId,key,text,x,y,z)
+        end
+        return
+    end
     local kind, model, price, turbo = parseSalePlate(text)
     if not kind then
         local tt = scanState.mark.turboOf(text) == 'Twin Turbo'
-        if fromSign or (scanState.mark.inAb() and scanState.mark.looksLikePlate(text)) then
+        if fromSign then
             kind, model, price, turbo = scanState.mark.parseShort(text)
         elseif sampId and not scanState.mark.objectHandle(sampId) and scanState.mark.looksLikePlate(text) then
             scanState.mark.holdShort(sampId, key, text, x, y, z)
@@ -3601,6 +3615,7 @@ end
 local function ingestAbCefPacket(packet)
     if not packet then return end
     scanState.marketplace.tuning.cef(packet)
+    scanState.marketplace.quality.cef(packet)
     local jsonText0 = tostring(packet.jsonText or '')
     local evName = tostring(packet.event or '')
     local rawText = tostring(packet.text or '')
@@ -3640,7 +3655,8 @@ local function queueCefSnap(packet)
     end
     local utf = ensure_utf8(text)
     if snap.event=='event.inventory.playerInventory' or snap.event=='event.inventory.updateCharacterTab'
-        or snap.event=='event.inventory.setPlayerInventoryVisible' or snap.event=='event.setActiveView' then
+        or snap.event=='event.inventory.setPlayerInventoryVisible' or snap.event=='event.setActiveView'
+        or snap.event=='event.vehicleMenu.pushVehicleItem' then
         incomingCef[#incomingCef+1]=snap
         if #incomingCef>256 then table.remove(incomingCef,1) end
         return
@@ -3682,6 +3698,7 @@ end)
 -- Только окна АБ. Угон и похожие списки dlg не перезаписывают.
 local lastDlgFinger = ''
 local function onAnyDialog(id, style, title, btn1, btn2, text)
+    if scanState.marketplace.tuning.internalDialog(id,title,text,style) then return end
     local kind = classifyDialog(id, title, text)
     if kind == 'list' then
         scanState.listUntil = os.clock() + 4
@@ -3691,7 +3708,7 @@ local function onAnyDialog(id, style, title, btn1, btn2, text)
     lastDlgFinger = finger
     scanState.marketplace.tuning.saleDialog(id,text or '',finger)
     scanState.marketplace.tuning.dialog(title or '',text or '')
-    scanState.currentDialog = {id=tonumber(id), kind=kind, finger=finger}
+    scanState.currentDialog = {id=tonumber(id), kind=kind, finger=finger,title=title,text=text}
     if kind == 'other' then
         scanState.dlg = nil
         if scanState.active then
@@ -3751,6 +3768,8 @@ if ok_ev and ev then
     end
     local prevDlg = ev.onShowDialog
     function ev.onShowDialog(id, style, title, btn1, btn2, text)
+        local handled,hide=pcall(scanState.marketplace.tuning.internalDialog,id,title,text,style)
+        if handled and hide then return false end
         pcall(function()
             incomingDlg[#incomingDlg + 1] = {
                 id = tonumber(id) or 0,
@@ -3762,10 +3781,18 @@ if ok_ev and ev then
             }
             if #incomingDlg > 12 then table.remove(incomingDlg, 1) end
         end)
+        local previousResult
         if prevDlg then
             local ok, a = pcall(prevDlg, id, style, title, btn1, btn2, text)
-            if ok then return a end
+            if ok and a~=nil then
+                if type(a)~='table' then return a end
+                previousResult=a
+                id,style,title,btn1,btn2,text=unpack(a)
+            end
         end
+        local ok,updated=pcall(scanState.tuningPrices.vehicleDialog,id,style,title,text)
+        if ok and updated then return {id,style,title,btn1,btn2,updated} end
+        return previousResult
     end
 
     local prevCreate = ev.onCreateObject
@@ -5528,6 +5555,12 @@ function scanState.marketplace.tuning.eval(js)
     return pcall(arz.eval,js,0)
 end
 
+function scanState.marketplace.tuning.internalDialog(id,title,text,style)
+    -- Quality is captured passively; it never owns or replays sale dialogs.
+    scanState.marketplace.quality.dialog(id,text)
+    return false
+end
+
 function scanState.marketplace.tuning.saleDialog(id,text,finger)
     local t=scanState.marketplace.tuning
     local m=scanState.marketplace
@@ -5570,6 +5603,7 @@ function scanState.marketplace.tuning.finishSale(resume,reason)
     if sale.opened and ctx and ctx.key==sale.context then
         t.eval("window.executeEvent('event.inventory.setPlayerInventoryVisible','[false]');window.executeEvent('event.setActiveView','[null]');if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('onActiveViewChanged|null',0);}")
         t.inventoryVisible=false
+        scanState.marketplace.quality.activeView=nil
     end
     if not resume then
         if reason then chat(reason,'warning') end
@@ -5656,6 +5690,7 @@ function scanState.marketplace.tuning.cef(packet)
     if type(doc)~='table' then local ok; ok,doc=safeDecodeJson(packet.jsonText or ''); if not ok then return end end
     local event=packet.event or ''
     if event=='event.inventory.updateCharacterTab' then
+        if doc[1]=='vehicle' then m.quality.ready,m.quality.readyAt=id,m.now() end
         local stage=t.stage
         if doc[1]=='vehicle' and stage and stage.id==id and stage.room==ctx.room and m.now()-stage.at<=10
             and stage.model and stage.data.t and stage.data.v then
@@ -5721,6 +5756,142 @@ function scanState.marketplace.tuning.pump(forceId)
     if t.pending and m.now()-t.pending.at>12 then t.pending=nil end
 end
 
+scanState.marketplace.quality={cache={},requests={},classNames={[1]='Хлам'}}
+function scanState.marketplace.quality.request(lot)
+    local m,q=scanState.marketplace,scanState.marketplace.quality
+    local ctx=m.context()
+    local vehicle=m.vehicleIdentity(lot)
+    if not ctx or not vehicle then return end
+    local key=ctx.room..'/'..vehicle
+    if q.job and q.job.key==key then return end
+    q.requests[key]={key=key,room=ctx.room,vehicle=tonumber(vehicle),lot=lot.id,handle=m.tuning.handle(tonumber(vehicle)),
+        notBefore=m.now()+1,expires=m.now()+20}
+end
+function scanState.marketplace.quality.finishRequest()
+    local m,q=scanState.marketplace,scanState.marketplace.quality
+    local job=q.job
+    q.job=nil
+    local ctx=m.context()
+    if job and (job.menuOpened or job.received) and not job.userChanged and ctx and ctx.room==job.room
+        and not (type(sampIsDialogActive)=='function' and sampIsDialogActive()) then
+        if type(setVirtualKeyDown)=='function' then
+            lua_thread.create(function()
+                q.escapeHeld=true
+                local pressed=pcall(setVirtualKeyDown,0x1B,true)
+                if pressed then wait(80) end
+                pcall(setVirtualKeyDown,0x1B,false)
+                q.escapeHeld=false
+            end)
+        else
+            m.tuning.eval("window.executeEvent('event.setActiveView','[null]');if(window.cef&&window.cef.SendMessage){window.cef.SendMessage('onActiveViewChanged|null',0);}")
+        end
+        q.activeView=nil
+    end
+end
+function scanState.marketplace.quality.clean(value)
+    if type(value)~='table' or type(value.name)~='string' or #value.name>64
+        or (value.name~='' and not value.name:match('^[^%c{}]+$')) or type(value.points)~='number'
+        or value.points<0 or value.points>1000000 or value.points~=math.floor(value.points) then return end
+    return {name=value.name,points=value.points}
+end
+function scanState.marketplace.quality.dialog(id,text)
+    if type(text)~='string' then return false end
+    local m,q=scanState.marketplace,scanState.marketplace.quality
+    local body=scanState.mark.clean(text)
+    local model,vehicle=body:match('Транспорт:%s*([^\n]-)%[(%d+)%]')
+    local name,points=body:match('Класс качества транспорта:%s*([^\n%(]+)%((%d+)%s*ед%.%)')
+    local ctx=m.context()
+    local owner=body:match('Владелец:%s*([^\n]+)')
+    local value=q.clean({name=name,points=tonumber(points)})
+    vehicle=tonumber(vehicle)
+    if not ctx or not vehicle or not value or normalizeName(owner or '')~=ctx.nick then return false end
+    local previous=q.cache[ctx.room..'/'..vehicle]
+    if previous and previous.rarity and previous.value.points==value.points then q.classNames[previous.rarity]=value.name end
+    q.cache[ctx.room..'/'..vehicle]={value=value,model=normalizeName(model),at=m.now(),handle=m.tuning.handle(vehicle),source='dialog'}
+    q.dirty=true
+    return false
+end
+function scanState.marketplace.quality.cef(packet)
+    if packet.event~='event.vehicleMenu.pushVehicleItem' and packet.event~='event.setActiveView' then return end
+    local m,q=scanState.marketplace,scanState.marketplace.quality
+    local ctx=m.context()
+    if not ctx then return end
+    local doc=packet.json
+    if type(doc)~='table' then local ok;ok,doc=safeDecodeJson(packet.jsonText or '');if not ok then return end end
+    if packet.event=='event.setActiveView' then
+        q.activeView=type(doc[1])=='string' and doc[1]~='null' and doc[1] or nil
+        if q.job and q.activeView then
+            local view=q.activeView:lower()
+            if view:find('vehicle',1,true) or view=='cars' then q.job.menuOpened=true
+            else q.job.userChanged=true end
+        end
+        return
+    end
+    for _,row in ipairs(doc) do
+        if type(row)=='table' and row.status=='loaded' and type(row.title)=='string' and type(row.labels)=='table' then
+            local vehicle,ambiguous
+            for _,label in ipairs(row.labels) do
+                local id=type(label)=='table' and label.icon=='icon-id' and tonumber(label.title)
+                if id and id>0 and id==math.floor(id) then
+                    if vehicle and vehicle~=id then ambiguous=true end
+                    vehicle=id
+                end
+            end
+            local value=q.clean({name=q.classNames[tonumber(row.rarity)] or '',points=tonumber(row.rarityLevel)})
+            if vehicle and not ambiguous and value then
+                local key=ctx.room..'/'..vehicle
+                local previous=q.cache[key]
+                if previous and previous.value.points==value.points and previous.source=='dialog' then value.name=previous.value.name end
+                q.cache[key]={value=value,model=normalizeName(row.title),at=m.now(),handle=m.tuning.handle(vehicle),
+                    rarity=tonumber(row.rarity),source='cef'}
+                q.dirty=true
+                if q.job and q.job.key==key then q.job.received=true end
+            end
+        end
+    end
+end
+function scanState.marketplace.quality.pump()
+    local m,q=scanState.marketplace,scanState.marketplace.quality
+    local ctx=m.ctx
+    if not ctx then q.requests={};q.finishRequest();return end
+    for _,lot in ipairs(pendingSell.lots) do
+        local id=m.vehicleIdentity(lot)
+        local cached=id and q.cache[ctx.room..'/'..id]
+        if cached and m.now()-cached.at<=900 and pendingSell.sameModel(cached.model,lot.model)
+            and (not cached.handle or cached.handle==m.tuning.handle(tonumber(id))) then
+            lot.marketQuality=cached.value
+        end
+    end
+    if q.dirty then q.dirty=nil; saveDealLogs() end
+    if q.job then
+        local job=q.job
+        if job.received or m.now()>=job.deadline or ctx.room~=job.room or m.currentVehicle()~=job.vehicle
+            or (job.handle and job.handle~=m.tuning.handle(job.vehicle)) or job.userChanged then q.finishRequest() end
+        return
+    end
+    for key,request in pairs(q.requests) do
+        if ctx.room~=request.room or m.now()>request.expires then q.requests[key]=nil end
+    end
+    if m.tuning.sale or scanState.active or scanState.wantScan or m.tuning.inventoryVisible or q.activeView
+        or not m.tuning.available() or type(sampSendChat)~='function'
+        or (type(sampIsDialogActive)=='function' and sampIsDialogActive()) then return end
+    for key,request in pairs(q.requests) do
+        if m.now()>=request.notBefore and m.currentVehicle()==request.vehicle then
+            local listed=false
+            for _,lot in ipairs(pendingSell.lots) do
+                if lot.id==request.lot and not lot.marketSuppressed and m.vehicleIdentity(lot)==tostring(request.vehicle) then listed=true end
+            end
+            q.requests[key]=nil
+            if listed and (not request.handle or request.handle==m.tuning.handle(request.vehicle)) then
+                request.deadline=m.now()+8;q.job=request
+                local ok=pcall(sampSendChat,'/cars')
+                if not ok then q.finishRequest() end
+                return
+            end
+        end
+    end
+end
+
 function scanState.marketplace.vehicleIdentity(lot)
     local id=tonumber(lot.marketVehicleId) or tonumber(tostring(lot.marketKey or ''):match('^vehicle:(%d+)$'))
     if id and id>0 and id==math.floor(id) then return tostring(id) end
@@ -5728,6 +5899,26 @@ end
 
 function scanState.marketplace.reconcileIdentities()
     local m,seen,changed=scanState.marketplace,{},false
+    -- A server can reuse a sign for another car before the old receipt is retired.
+    -- Repair persisted contradictory identities without transferring old tuning.
+    for index=#pendingSell.lots,1,-1 do
+        local old=pendingSell.lots[index]
+        local signVehicle=tonumber(tostring(old.marketKey or ''):match('^vehicle:(%d+)$'))
+        if signVehicle and old.marketVehicleId and signVehicle~=tonumber(old.marketVehicleId) and not m.salePending(old.id) then
+            for _,new in ipairs(pendingSell.lots) do
+                if new~=old and m.vehicleIdentity(new)==tostring(signVehicle) and (new.at or 0)>=(old.at or 0)
+                    and pendingSell.sameModel(new.model,old.model) and not m.salePending(new.id) then
+                    for _,field in ipairs({'marketKey','marketObjectId','marketObjectGeneration','marketObjectHandle',
+                        'marketX','marketY','marketZ','marketObservedAt'}) do
+                        if new[field]==nil then new[field]=old[field] end
+                    end
+                    table.remove(pendingSell.lots,index)
+                    changed=true
+                    break
+                end
+            end
+        end
+    end
     local i=1
     while i<=#pendingSell.lots do
         local lot=pendingSell.lots[i]
@@ -5740,7 +5931,7 @@ function scanState.marketplace.reconcileIdentities()
             end
             for _,field in ipairs({'marketKey','marketObjectId','marketObjectGeneration','marketObjectHandle',
                 'marketX','marketY','marketZ','marketObservedAt','marketVehicleId','marketChatConfirmed',
-                'marketTurbo','marketTurboKnown','marketMileage','marketTuning'}) do
+                'marketTurbo','marketTurboKnown','marketMileage','marketTuning','marketQuality'}) do
                 if keep[field]==nil then keep[field]=lot[field] end
             end
             keep.marketVehicleId=tonumber(identity)
@@ -5797,7 +5988,7 @@ function scanState.marketplace.collect()
     end
     for _,lot in ipairs(pendingSell.lots) do
         local price=cleanPriceNum(lot.price)
-        if not blocked[lot.id] and not lot.marketSuppressed and (not lot.marketRestoreUntil or lot.marketRestoreUntil>m.now())
+        if not blocked[lot.id] and not lot.marketSuppressed and not lot.marketGoneAt and (not lot.marketRestoreUntil or lot.marketRestoreUntil>m.now())
             and price and not isGenericCarName(lot.model)
             and scanState.mark.validModel(lot.model)
             and (lot.source=='chat' or lot.source=='plate' or lot.source=='market-plate') then
@@ -5805,7 +5996,7 @@ function scanState.marketplace.collect()
             if mileage and (mileage~=mileage or mileage<0 or mileage>1000000000) then mileage=nil end
             rows[#rows+1]={i=tostring(lot.id),m=chatState.truncate(lot.model,96),p=price,
                 t=lot.marketTurbo==true or nil,tk=lot.marketTurboKnown==true or nil,km=mileage,
-                u=scanState.marketplace.tuning.clean(lot.marketTuning)}
+                u=scanState.marketplace.tuning.clean(lot.marketTuning),qa=m.quality.clean(lot.marketQuality)}
         end
     end
     table.sort(rows,function(a,b) return a.i<b.i end)
@@ -5883,12 +6074,32 @@ function scanState.marketplace.observeOwn(text,model,price,turbo,owner,objectId,
         return
     end
     local found
-    for _,lot in ipairs(pendingSell.lots) do if lot.marketKey==key then found=lot; break end end
+    -- A key/object reused for a new physical vehicle is no longer the old listing.
+    if number then
+        for index=#pendingSell.lots,1,-1 do
+            local old=pendingSell.lots[index]
+            local reused=old.marketKey==key or (object and old.marketObjectId==objectId
+                and old.marketObjectGeneration==object.generation)
+            if reused and old.marketVehicleId and tonumber(old.marketVehicleId)~=tonumber(number) then
+                if m.salePending(old.id) then old.marketSuppressed=true
+                else table.remove(pendingSell.lots,index) end
+                saveDealLogs()
+            end
+        end
+    end
+    for _,lot in ipairs(pendingSell.lots) do
+        if (lot.marketKey==key and (not number or not lot.marketVehicleId or tonumber(lot.marketVehicleId)==tonumber(number)))
+            or (number and m.vehicleIdentity(lot)==tostring(tonumber(number))) then found=lot; break end
+    end
     -- Material changes can give the same physical sign a new parking/vehicle label.
     if not found and object then
         for _,lot in ipairs(pendingSell.lots) do
             if lot.marketObjectId==objectId and lot.marketObjectGeneration==object.generation
-                and not m.salePending(lot.id) then found=lot; break end
+                and not m.salePending(lot.id) then
+                if number and lot.marketVehicleId and tonumber(lot.marketVehicleId)~=tonumber(number) then
+                    lot.marketSuppressed=true
+                else found=lot; break end
+            end
         end
     end
     local relocated=false
@@ -5898,6 +6109,7 @@ function scanState.marketplace.observeOwn(text,model,price,turbo,owner,objectId,
             local object=lot.marketObjectId and scanState.mark.objects[lot.marketObjectId]
             local stillVisible=object and object.generation==lot.marketObjectGeneration
             if lot.marketKey and not stillVisible and lot.marketGoneAt and os.clock()-lot.marketGoneAt<=30
+                and (not number or not lot.marketVehicleId or tonumber(lot.marketVehicleId)==tonumber(number))
                 and not m.salePending(lot.id) and pendingSell.sameModel(lot.model,model) then
                 if candidate then candidate=nil; break end
                 candidate=lot
@@ -5908,6 +6120,7 @@ function scanState.marketplace.observeOwn(text,model,price,turbo,owner,objectId,
     if not found then
         for _,lot in ipairs(pendingSell.lots) do
             if not lot.marketKey and lot.price==price
+                and (not number or not lot.marketVehicleId or tonumber(lot.marketVehicleId)==tonumber(number))
                 and (isGenericCarName(lot.model) or pendingSell.sameModel(lot.model,model)) then found=lot; break end
         end
     end
@@ -5916,7 +6129,11 @@ function scanState.marketplace.observeOwn(text,model,price,turbo,owner,objectId,
         found=pendingSell.lots[#pendingSell.lots]
     end
     local moved=found.marketX and x and y and z and dist3(found.marketX,found.marketY,found.marketZ,x,y,z)>0.5
-    if not pendingSell.sameModel(found.model,model) then found.marketTuning=nil end
+    if not pendingSell.sameModel(found.model,model)
+        or (number and m.vehicleIdentity(found) and m.vehicleIdentity(found)~=tostring(tonumber(number))) then
+        found.marketTuning=nil
+        found.marketQuality=nil
+    end
     local replacing=found.marketKey and (relocated or moved or found.model~=model or found.price~=price)
     local changed=found.model~=model or found.price~=price or found.marketKey~=key or moved
     if replacing then
@@ -5996,7 +6213,7 @@ end
 
 function scanState.marketplace.fingerprint(rows)
     local parts={}
-    for _,row in ipairs(rows) do parts[#parts+1]=table.concat({row.i,row.m,row.p,row.t and 'tt' or '',row.km or '',row.tk and 'known' or '',row.u and encodeJson(row.u) or ''},'\1') end
+    for _,row in ipairs(rows) do parts[#parts+1]=table.concat({row.i,row.m,row.p,row.t and 'tt' or '',row.km or '',row.tk and 'known' or '',row.u and encodeJson(row.u) or '',row.qa and encodeJson(row.qa) or ''},'\1') end
     return table.concat(parts,'\2')
 end
 
@@ -6033,7 +6250,7 @@ function scanState.marketplace.ingest(line,ctx)
         rows[#rows+1]={key=p.s..'/'..row.i,id=row.i,model=normalizeName(chatState.truncate(row.m,96)),price=cleanPriceNum(row.p),
             seller=chatState.truncate(p.n,64):gsub('[%c]',''),currency=p.c,turbo=row.t==true,
             turboKnown=row.tk==true or row.t==true,mileage=mileage,updated=at,expires=at+m.ttl,
-            tuning=m.tuning.clean(row.u),tuningOmitted=row.ut==true}
+            tuning=m.tuning.clean(row.u),tuningOmitted=row.ut==true,quality=m.quality.clean(row.qa)}
     end
     if not previous then
         local count=0
@@ -6146,7 +6363,7 @@ function scanState.marketplace.poll()
         function(body,err,code)
             if generation~=m.viewGeneration or (m.viewCtx or m.ctx)~=ctx then return end
             m.pollBusy=false
-            m.nextPoll=m.now()+(scanState.cloud.url and 10 or 15)
+            m.nextPoll=m.now()+180
             if err or not body or tonumber(code or 200)>=300 then
                 m.pollFailures=math.min(5,(m.pollFailures or 0)+1)
                 m.pollBlockedUntil=m.now()+(tonumber(code)==429 and 120 or math.min(15,3*2^(m.pollFailures-1)))
@@ -6211,7 +6428,7 @@ function scanState.marketplace.rows(filter,minimum,maximum,onlyTT,ownOnly)
         for _,lot in ipairs(m.collect()) do
             add({key=m.session..'/'..lot.i,id=lot.i,model=lot.m,price=lot.p,seller=m.ctx.nick,
                 currency=m.ctx.currency,turbo=lot.t==true,turboKnown=lot.tk==true or lot.t==true,mileage=lot.km,own=true,updated=m.now(),
-                tuning=lot.u})
+                tuning=lot.u,quality=m.quality.clean(lot.qa)})
         end
     end
     table.sort(result,function(a,b)
@@ -6310,6 +6527,7 @@ function scanState.marketplace.pump()
     end
     m.reconcileIdentities()
     m.tuning.pump()
+    m.quality.pump()
     m.reconcileRelocations()
     -- Close-range removal is confirmed after a grace period for a moved/recreated sign.
     -- Keep the receipt for sale accounting; only withdraw its public advertisement.
@@ -6542,6 +6760,401 @@ function scanState.scaledUi(raw, getScale)
     return ui
 end
 
+-- Local experimental estimates. These are user-entered prices, never server averages.
+scanState.tuningPrices={stores={}}
+function scanState.tuningPrices.vehicleDialog(id,style,title,text)
+    if tonumber(id)~=25217 or tonumber(style)~=5 or type(text)~='string'
+        or not stripColors(ensure_utf8(title or '')):match('%[ID:%d+%]') then return end
+    local body=ensure_utf8(text):gsub('\r','')
+    local header=stripColors(body:match('^[^\n]*') or '')
+    if header~='Название предмета\tКоличество' then return end
+    local groups={['Визуальный тюнинг']='v',['Технический тюнинг']='t',
+        ['Винил']='p',['Модификация']='m',['Номерной знак']='n'}
+    local lines,items,tuning={}, {}, {}
+    local group
+    for line in (body..'\n'):gmatch('(.-)\n') do
+        lines[#lines+1]=line
+        local plain=stripColors(line)
+        group=groups[plain] or group
+        local name=plain:match('^%[%d+%]%s*(.-)\t') or plain:match('^%[%d+%]%s*(.+)$')
+        if group and name and name~='' then
+            tuning[group]=tuning[group] or {}; table.insert(tuning[group],name)
+            items[#items+1]={line=#lines,key=group..':'..name}
+        end
+    end
+    if #items==0 then return end
+    local view=scanState.marketplace.context()
+    if not view then return end
+    local estimate=scanState.tuningPrices.estimate(tuning,view)
+    local pricesByKey={}
+    for _,row in ipairs(estimate.rows) do pricesByKey[row.key]=row.price end
+    lines[1]=lines[1]..'\t{ffcc66}Средняя цена'
+    for _,item in ipairs(items) do
+        local line=lines[item.line]
+        local name,amount=line:match('^([^\t]*)\t([^\t]*)')
+        local price=pricesByKey[item.key]
+        lines[item.line]=(name or line)..'\t'..(amount or '')..'\t{A8D5A2}'
+            ..(price and fmtMoney(price,view.currency) or 'нет цены')
+    end
+    return d(table.concat(lines,'\n'))
+end
+function scanState.tuningPrices.marketPrices(view)
+    local p=scanState.tuningPrices
+    if not p.marketCache or os.time()-p.marketCache.loaded>=15 then
+        local cache={loaded=os.time(),prices={}}
+        for _,suffix in ipairs({'','.bak'}) do
+            local f=io.open(DATA_DIR..'\\arzmarket-vc.json'..suffix,'rb')
+            if f then
+                local raw=f:read(2000001); f:close()
+                local ok,data=false,nil
+                if type(raw)=='string' and #raw<=2000000 then ok,data=safeDecodeJson(raw) end
+                if ok and type(data)=='table' and data.version==1 and type(data.rows)=='table'
+                    and type(data.captured)=='number' and data.captured<=os.time()+60 and os.time()-data.captured<=1800 then
+                    local grouped={}
+                    for _,row in ipairs(data.rows) do
+                        if type(row)=='table' and type(row.item)=='string' and cleanPriceNum(row.price)
+                            and type(row.at)=='number' and row.at<=os.time()+60 and os.time()-row.at<=86400 then
+                            local id=row.item:match('^(%d+)$')
+                            local name=id and scanState.marketplace.tuning.itemName(id) or row.item
+                            grouped[name]=grouped[name] or {}
+                            table.insert(grouped[name],row.price)
+                        end
+                    end
+                    for name,values in pairs(grouped) do
+                        table.sort(values)
+                        local n=#values
+                        cache.prices[name]={price=(values[math.floor((n+1)/2)]+values[math.floor(n/2)+1])/2,count=n}
+                    end
+                    cache.captured=data.captured
+                    break
+                end
+            end
+        end
+        p.marketCache=cache
+    end
+    return p.marketCache,view and view.currency=='VC$' and 1 or 100
+end
+function scanState.tuningPrices.store(view)
+    local p=scanState.tuningPrices
+    local host,port=tostring(view and view.room or ''):match('^([^:]+):(%d+)$')
+    local identity=host and scanState.pricesIdentity(host,port)
+    if not identity then return nil,'Сервер не выбран' end
+    if p.stores[identity.room] then return p.stores[identity.room] end
+    local filename=identity.path:match('([^\\]+)$')
+    local store={room=identity.room,path=DATA_DIR..'\\tuning-prices\\'..filename,prices={}}
+    for _,path in ipairs({store.path,store.path..'.bak'}) do
+        local f=io.open(path,'rb')
+        if f then
+            local raw=f:read(1000001); f:close()
+            local ok,data=false,nil
+            if type(raw)=='string' and #raw<=1000000 then ok,data=safeDecodeJson(raw) end
+            if ok and type(data)=='table' and data.server==store.room and type(data.prices)=='table' then
+                for key,value in pairs(data.prices) do
+                    if type(key)=='string' and #key<=200 and type(value)=='number' and cleanPriceNum(value)==value then
+                        store.prices[key]=value
+                    end
+                end
+                store.error=nil
+                break
+            end
+            store.error='Файл цен повреждён. Проверьте '..store.path
+        end
+    end
+    p.stores[identity.room]=store
+    return store
+end
+function scanState.tuningPrices.estimate(tuning,view)
+    local store,err=scanState.tuningPrices.store(view)
+    local market,factor=scanState.tuningPrices.marketPrices(view)
+    local result={rows={},total=0,count=0,known=0,error=err or (store and store.error)}
+    local indexed={}
+    for _,group in ipairs({'t','v','p','m','n'}) do
+        for _,name in ipairs(type(tuning)=='table' and tuning[group] or {}) do
+            local key=group..':'..name
+            local row=indexed[key]
+            if not row then
+                row={key=key,name=name,group=group,count=0,price=store and store.prices[key]}
+                if not row.price and market.prices[name] then
+                    row.price=math.floor(market.prices[name].price*factor)
+                    row.automatic=true; row.offers=market.prices[name].count
+                end
+                indexed[key]=row; result.rows[#result.rows+1]=row
+            end
+            row.count=row.count+1; result.count=result.count+1
+            if row.price then result.total=result.total+row.price; result.known=result.known+1 end
+        end
+    end
+    result.captured=market.captured
+    result.factor=factor
+    return result
+end
+function scanState.tuningPrices.set(view,key,value)
+    local store,err=scanState.tuningPrices.store(view)
+    if not store or store.error then return false,err or store.error end
+    if type(key)~='string' or #key>200 or not key:match('^[tvpmn]:.+') then return false,'Выберите деталь' end
+    local price=value~=nil and cleanPriceNum(value) or nil
+    if value~=nil and not price then return false,'Введите целую цену больше нуля, например 1500000' end
+    local updated={}
+    for k,v in pairs(store.prices) do updated[k]=v end
+    updated[key]=price
+    ensureDir(DATA_DIR); ensureDir(DATA_DIR..'\\tuning-prices')
+    local ok,why=scanState.writeJsonFile(store.path,{version=1,server=store.room,prices=updated})
+    if not ok then return false,'Не удалось сохранить цены: '..tostring(why) end
+    store.prices=updated
+    return true
+end
+
+scanState.tuningImages={slots={},resolved={},tick=0,budget=0}
+function scanState.tuningImages.u16(bytes,offset)
+    local a,b=bytes:byte(offset,offset+1)
+    if a and b then return a+b*256 end
+end
+function scanState.tuningImages.u32(bytes,offset)
+    local icons=scanState.tuningImages
+    local a,b=icons.u16(bytes,offset),icons.u16(bytes,offset+2)
+    if a and b then return a+b*65536 end
+end
+function scanState.tuningImages.entryOffset(file,entry)
+    local icons=scanState.tuningImages
+    if type(entry.localOffset)~='number' or entry.localOffset<0 or entry.localOffset~=math.floor(entry.localOffset) then return end
+    file:seek('set',entry.localOffset)
+    local header=file:read(30)
+    if not header or #header~=30 or header:sub(1,4)~='PK\3\4' or icons.u16(header,9)~=0 then return end
+    local offset=entry.localOffset+30+icons.u16(header,27)+icons.u16(header,29)
+    if offset+entry.size>(icons.archiveSize or 0) then return end
+    entry.offset=offset
+    return offset
+end
+function scanState.tuningImages.openArchive()
+    local icons=scanState.tuningImages
+    icons.aliases,icons.entries={},{}
+    local f=io.open(getWorkingDirectory()..'\\..\\arizona\\items.zip','rb')
+    if not f then return end
+    local ok=pcall(function()
+        local size=f:seek('end');icons.archiveSize=size
+        local length=math.min(size,65557)
+        f:seek('set',size-length)
+        local tail=f:read(length)
+        local position,from=nil,1
+        while true do
+            local at=tail:find('PK\5\6',from,true)
+            if not at then break end
+            position=at;from=at+1
+        end
+        if not position or #tail-position<21 then return end
+        local count=icons.u16(tail,position+10)
+        local directorySize=icons.u32(tail,position+12)
+        local directoryOffset=icons.u32(tail,position+16)
+        if count>50000 or directorySize>10000000 or directoryOffset+directorySize>size then return end
+        f:seek('set',directoryOffset)
+        local directory=f:read(directorySize)
+        if not directory or #directory~=directorySize then return end
+        local at,entries,metadata=1,{},nil
+        for _=1,count do
+            if directory:sub(at,at+3)~='PK\1\2' or #directory-at<45 then return end
+            local nameLength=icons.u16(directory,at+28)
+            local extraLength=icons.u16(directory,at+30)
+            local commentLength=icons.u16(directory,at+32)
+            local nextEntry=at+46+nameLength+extraLength+commentLength
+            if nextEntry>#directory+1 then return end
+            local name=directory:sub(at+46,at+45+nameLength)
+            if icons.u16(directory,at+10)==0 then
+                local entry={size=icons.u32(directory,at+24),localOffset=icons.u32(directory,at+42)}
+                local id=name:match('^icons/256/(%d+)%.webp$')
+                if id then entries[id]=entry elseif name=='items.bin' then metadata=entry end
+            end
+            at=nextEntry
+        end
+        icons.entries=entries
+        if metadata and metadata.size<=12000000 then
+            local offset=icons.entryOffset(f,metadata)
+            if offset then
+                f:seek('set',offset)
+                local data=f:read(metadata.size)
+                if data and #data==metadata.size and data:sub(1,4)=='ITM2' then icons.metadata=data end
+            end
+        end
+    end)
+    f:close()
+    if not ok then icons.entries={} end
+end
+function scanState.tuningImages.iconId(id,name)
+    local icons=scanState.tuningImages
+    local key=tostring(id)
+    if icons.aliases[key]==nil and icons.metadata and #name<65536 then
+        local needle=string.char(#name%256,math.floor(#name/256))..name
+        local from=1
+        while true do
+            local at=icons.metadata:find(needle,from,true)
+            if not at then break end
+            if at>=5 and icons.u16(icons.metadata,at-4)==id then
+                local image=icons.u16(icons.metadata,at-2)
+                if icons.entries[tostring(image)] then icons.aliases[key]=image;break end
+            end
+            from=at+1
+        end
+        if icons.aliases[key]==nil then icons.aliases[key]=false end
+    end
+    return icons.aliases[key] or id
+end
+function scanState.tuningImages.resolve(name)
+    local icons=scanState.tuningImages
+    if not icons.aliases then icons.openArchive() end
+    name=normalizeName(ensure_utf8(name))
+    if icons.resolved[name]~=nil then return icons.resolved[name] or nil end
+    if not icons.names then
+        local tuning=scanState.marketplace.tuning
+        tuning.itemName(0) -- Load the same ID/name dictionary used for installed parts.
+        icons.names={}
+        local names={}
+        for id,label in pairs(tuning.itemNames or {}) do names[tostring(id)]=label end
+        for id,label in pairs(tuning.names or {}) do names[tostring(id)]=label end
+        for id,label in pairs(names) do
+            if tonumber(id) and type(label)=='string' then
+                local key=normalizeName(ensure_utf8(label))
+                icons.names[key]=icons.names[key] or {}
+                icons.names[key][#icons.names[key]+1]=tonumber(id)
+            end
+        end
+    end
+    local found
+    for _,id in ipairs(icons.names[name] or {}) do
+        local imageId=icons.iconId(id,name)
+        if icons.entries and icons.entries[tostring(imageId)] then
+            if found and found~=imageId then icons.resolved[name]=false;return end
+            found=imageId
+        end
+    end
+    icons.resolved[name]=found or false
+    return found
+end
+function scanState.tuningImages.read(id)
+    local icons=scanState.tuningImages
+    local entry=icons.entries and icons.entries[tostring(id)]
+    if type(entry)~='table' or type(entry.size)~='number' or entry.size<12 or entry.size>262144
+        or entry.size~=math.floor(entry.size) then return end
+    local f=io.open(getWorkingDirectory()..'\\..\\arizona\\items.zip','rb')
+    if not f then return end
+    if icons.archiveSize and f:seek('end')~=icons.archiveSize then f:close();return end
+    local offset=entry.offset or icons.entryOffset(f,entry)
+    if not offset then f:close();return end
+    f:seek('set',offset)
+    local bytes=f:read(entry.size);f:close()
+    if type(bytes)=='string' and #bytes==entry.size and bytes:sub(1,4)=='RIFF' and bytes:sub(9,12)=='WEBP' then return bytes end
+end
+function scanState.tuningImages.makeDecoder()
+-- Decode a local inventory image with Windows WIC; return a 32-bit TGA in memory.
+local ffi=require('ffi')
+pcall(ffi.cdef,[[
+typedef struct {uint32_t a;uint16_t b,c;uint8_t d[8];} ABarzImageGUID;
+int32_t __stdcall CoInitializeEx(void*,uint32_t);
+void __stdcall CoUninitialize(void);
+int32_t __stdcall CoCreateInstance(const ABarzImageGUID*,void*,uint32_t,const ABarzImageGUID*,void**);
+void* __stdcall SHCreateMemStream(const uint8_t*,uint32_t);
+]])
+local ole=ffi.load('ole32')
+local shell=ffi.load('shlwapi')
+local factoryClass=ffi.new('ABarzImageGUID',{0xcacaf262,0x9370,0x4615,{0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a}})
+local factoryInterface=ffi.new('ABarzImageGUID',{0xec5ec8a9,0xc395,0x4314,{0x9c,0x77,0x54,0xd7,0xa9,0x35,0xff,0x70}})
+local bgra=ffi.new('ABarzImageGUID',{0x6fddc324,0x4e03,0x4bfe,{0xb1,0x85,0x3d,0x77,0x76,0x8d,0xc9,0x0f}})
+local function method(object,index,signature)
+    return ffi.cast(signature,ffi.cast('void***',object)[0][index])
+end
+local function check(value,stage)
+    if value<0 then error(stage..': '..tonumber(value),0) end
+end
+local function word(value)return string.char(value%256,math.floor(value/256))end
+return function(bytes)
+    if type(bytes)~='string' or #bytes<12 or #bytes>262144 then return nil,'Invalid image size' end
+    local resources={}
+    local initialized=ole.CoInitializeEx(nil,0)
+    local ok,result=pcall(function()
+        if initialized<0 and initialized~=-2147417850 then check(initialized,'COM initialization') end
+        local out=ffi.new('void*[1]')
+        check(ole.CoCreateInstance(factoryClass,nil,1,factoryInterface,out),'WIC factory')
+        local factory=out[0];resources[#resources+1]=factory
+        local stream=shell.SHCreateMemStream(ffi.cast('const uint8_t*',bytes),#bytes)
+        if stream==nil then error('Image stream unavailable',0) end
+        resources[#resources+1]=stream
+        check(method(factory,4,'int32_t(__stdcall *)(void*,void*,const ABarzImageGUID*,uint32_t,void**)')(factory,stream,nil,0,out),'Image decoder')
+        local decoder=out[0];resources[#resources+1]=decoder
+        check(method(decoder,13,'int32_t(__stdcall *)(void*,uint32_t,void**)')(decoder,0,out),'Image frame')
+        local frame=out[0];resources[#resources+1]=frame
+        local width,height=ffi.new('uint32_t[1]'),ffi.new('uint32_t[1]')
+        check(method(frame,3,'int32_t(__stdcall *)(void*,uint32_t*,uint32_t*)')(frame,width,height),'Image dimensions')
+        local w,h=tonumber(width[0]),tonumber(height[0])
+        if w<1 or h<1 or w>512 or h>512 then error('Unsupported image dimensions',0) end
+        check(method(factory,10,'int32_t(__stdcall *)(void*,void**)')(factory,out),'Pixel converter')
+        local converter=out[0];resources[#resources+1]=converter
+        check(method(converter,8,'int32_t(__stdcall *)(void*,void*,const ABarzImageGUID*,uint32_t,void*,double,uint32_t)')(converter,frame,bgra,0,nil,0,0),'BGRA conversion')
+        local size=w*h*4
+        local pixels=ffi.new('uint8_t[?]',size)
+        check(method(converter,7,'int32_t(__stdcall *)(void*,const void*,uint32_t,uint32_t,uint8_t*)')(converter,nil,w*4,size,pixels),'Pixel read')
+        return string.char(0,0,2)..string.rep('\0',9)..word(w)..word(h)..string.char(32,40)..ffi.string(pixels,size)
+    end)
+    for i=#resources,1,-1 do pcall(function()method(resources[i],2,'uint32_t(__stdcall *)(void*)')(resources[i])end) end
+    if initialized>=0 then ole.CoUninitialize() end
+    if ok then return result end
+    return nil,tostring(result)
+end
+
+end
+function scanState.tuningImages.request(id,slot)
+    local icons=scanState.tuningImages
+    if icons.loading then return end
+    icons.loading=true
+    local ok,why=pcall(function()
+        local bytes=icons.read(id)
+        if not bytes then error('Icon unavailable in current game archive',0) end
+        if not icons.decoder then icons.decoder=icons.makeDecoder() end
+        local image,err=icons.decoder(bytes)
+        if not image then error(err or 'Icon decoding failed',0) end
+        slot.image=image
+    end)
+    slot.failed=not ok
+    icons.loading=false
+    if not ok and not icons.reported then
+        icons.reported=true
+        print('ABarz tuning images: '..tostring(why))
+    end
+end
+function scanState.tuningImages.draw(ui,name)
+    local icons=scanState.tuningImages
+    local id=icons.resolve(name)
+    local slot=id and icons.slots[id]
+    if id and not slot and icons.budget>0 and not icons.loading then
+        icons.budget=icons.budget-1
+        slot={}
+        icons.slots[id]=slot
+        icons.request(id,slot)
+        local count,oldest=0,nil
+        for key,value in pairs(icons.slots) do
+            count=count+1
+            if key~=id and (not oldest or (value.used or 0)<(icons.slots[oldest].used or 0)) then oldest=key end
+        end
+        if count>128 and oldest then icons.slots[oldest]=nil end
+    end
+    if slot and slot.image and not slot.texture then
+        local ok,texture=pcall(imgui.CreateTextureFromFileInMemory,ffi.cast('const char*',slot.image),#slot.image)
+        slot.texture=ok and texture or nil
+        slot.image=nil
+    end
+    if slot and slot.texture then
+        icons.tick=icons.tick+1;slot.used=icons.tick
+        ui.Image(slot.texture,ui.ImVec2(28,28))
+        if ui.IsItemHovered() then
+            ui.BeginTooltip()
+            ui.Text(name)
+            ui.Image(slot.texture,ui.ImVec2(192,192))
+            ui.TextDisabled('Иконка предмета из инвентаря')
+            ui.EndTooltip()
+        end
+    else
+        ui.Dummy(ui.ImVec2(28,28))
+    end
+    ui.SameLine()
+end
+
 local function setupUi()
 local rawImgui = imgui
 local uiScale = 1
@@ -6691,6 +7304,27 @@ end
 
 local baseTab, dealsTab, settingsTab = 1, 1, 1
 local baseDetailsOpen = false
+local priceScrollTop = false
+
+function scanState.openPriceSearch(query)
+    query=chatState.truncate(normalizeName(query or ''),63)
+    if query=='' then chat('Введите название автомобиля: /abprice [название] или /carprice [название]','warning');return end
+    rebuildList()
+    local rows=findPrices(query)
+    if query~='' and #rows==0 and not scanState.isViceCity() then
+        local average,matched=resolveAvgForModel(query)
+        if average and matched then query=chatState.truncate(matched,63);rows=findPrices(query) end
+    end
+    filter=query
+    setCString(searchBuf,64,filter)
+    selectedName=rows[1] and rows[1].name or nil
+    for _,row in ipairs(rows) do
+        if foldName(row.name)==foldName(query) then selectedName=row.name;break end
+    end
+    page,baseTab,baseDetailsOpen=1,1,false
+    priceScrollTop=true
+    win[0]=true
+end
 
 local function chartDate(date)
     local year,month,day=date:match('^(%d%d%d%d)%-(%d%d)%-(%d%d)$')
@@ -6852,23 +7486,42 @@ local function marketValue(label,value,color,scale)
     imgui.SetWindowFontScale(1.0)
 end
 
-local function drawMarketTuning(selected)
+local function drawMarketTuning(selected,view)
     local count=0
     if selected.tuning then
         for _,items in pairs(selected.tuning) do count=count+#items end
     end
     local title=count>0 and ('Установленный тюнинг · %d'):format(count) or 'Установленный тюнинг'
     if not imgui.CollapsingHeader(title..'###tuning-'..tostring(selected.key or selected.id)) then return end
+    scanState.tuningImages.budget=2
     if selected.tuning then
+        view=view or scanState.marketplace.viewCtx or scanState.marketplace.ctx
+        local estimate=scanState.tuningPrices.estimate(selected.tuning,view)
+        local indexed={}
+        for _,row in ipairs(estimate.rows) do indexed[row.key]=row end
         for _,group in ipairs({{'t','Технический'},{'v','Визуальный'},{'p','Винил'},{'m','Модификация'},{'n','Номер'}}) do
             local items=selected.tuning[group[1]]
             if items and #items>0 then
                 imgui.Text(group[2])
-                for _,name in ipairs(items) do imgui.TextWrapped('• '..name) end
+                for _,name in ipairs(items) do
+                    scanState.tuningImages.draw(imgui,name)
+                    local row=indexed[group[1]..':'..name]
+                    local price=row and row.price
+                    local suffix=price and (fmtMoney(price,selected.currency)..(row.automatic and '' or ' · своя цена')) or 'нет цены'
+                    imgui.TextWrapped('• '..name..' — '..suffix)
+                end
                 spaced(0,4)
             end
         end
-        if count==0 then imgui.TextDisabled('В считанных разделах деталей нет') end
+        if count==0 then imgui.TextDisabled('В считанных разделах деталей нет')
+        elseif estimate.captured then
+            imgui.TextWrapped('Чтоб обновить цены, открой /crr заново.')
+        else
+            imgui.TextWrapped('Чтоб появились цены, нужно использовать Arizona Market. Если он у вас есть, откройте его 1 раз и выберите Vice City.')
+        end
+        if count>0 then
+            imgui.TextWrapped('Цены на номерные рамки, номера ТС и другие предметы с рейтингом могут различаться в зависимости от рейтинга. Учитывайте это и уточняйте стоимость таких предметов самостоятельно.')
+        end
     else
         imgui.TextWrapped(selected.tuningOmitted and 'Полный список деталей не передан: превышен размер объявления.'
             or 'Тюнинг ещё не считан продавцом.')
@@ -6975,7 +7628,9 @@ local function drawMarketplaceContent()
                 imgui.TextDisabled(m.roomLabel(view.room))
             imgui.EndChild()
             spaced(0,10)
-            marketValue('Цена лота',fmtMoney(selected.price,selected.currency),accent(),1.20)
+            local commission=math.floor(selected.price*4/100)
+            marketValue('Цена лота',fmtMoney(selected.price,selected.currency)..' + '
+                ..fmtMoney(commission,selected.currency)..' (Комиссия)',accent(),1.20)
             if average then
                 marketValue('Средняя сервера',fmtMoney(average.price,selected.currency))
                 local delta=selected.price-average.price
@@ -6999,6 +7654,8 @@ local function drawMarketplaceContent()
             spaced(0,8)
             marketValue('Продавец',selected.seller)
             if imgui.IsItemHovered() then imgui.SetTooltip('Ник передан скриптом продавца. Сервер Arizona его не подтверждает.') end
+            marketValue('Качество',selected.quality and ((selected.quality.name~='' and selected.quality.name..' · ' or '')
+                ..selected.quality.points..' ед.') or 'Не считано')
             marketValue('Тюнинг',selected.turbo and 'Twin Turbo' or (selected.turboKnown and 'Без Twin Turbo' or 'Не указан'),
                 selected.turbo and accent() or nil)
             imgui.SetCursorPosX(150)
@@ -7013,7 +7670,7 @@ local function drawMarketplaceContent()
             spaced(0,8)
             imgui.Separator()
             spaced(0,8)
-            drawMarketTuning(selected)
+            drawMarketTuning(selected,view)
             local vehicle=selected.own and m.vehicleIdentity({marketKey=selected.id})
             if selected.own then
                 for _,lot in ipairs(pendingSell.lots) do if lot.id==selected.id then vehicle=m.vehicleIdentity(lot); break end end
@@ -7156,6 +7813,7 @@ local function drawBase()
     local leftW = imgui.GetContentRegionAvail().x
     if (not selectedName or not prices[selectedName]) and rows[1] then selectedName=rows[1].name end
     imgui.BeginChild('##left', imgui.ImVec2(leftW, listH), true)
+        if priceScrollTop then imgui.SetScrollY(0);priceScrollTop=false end
         imgui.TextDisabled(('Машины  ·  %d'):format(#rows))
         spaced(0, 2)
         imgui.TextDisabled('Модель транспорта')
@@ -7165,7 +7823,7 @@ local function drawBase()
         imgui.TextDisabled('Средняя цена')
         imgui.Separator()
         if #rows == 0 then
-            imgui.TextDisabled('Пока пусто — сначала скан')
+            imgui.TextDisabled(#priceList==0 and 'Пока пусто — сначала скан' or 'По этому названию машины не найдены')
         else
             for i, row in ipairs(rows) do
                 imgui.PushIDStr('c' .. i)
@@ -8049,47 +8707,8 @@ function main()
     sampRegisterChatCommand('abchat', function()
         setChatEnabled(not chatOn[0])
     end)
-    local function cmdAbPrice(arg)
-        if scanState.isViceCity() then
-            chat('На Vice City нет системных средних цен. Лоты и их цены доступны в /abarz → Цены.', 'info')
-            return
-        end
-        arg = tostring(arg or ''):gsub('^%s+', ''):gsub('%s+$', '')
-        if arg == '' then
-            chat('Использование: /abprice [название]')
-            return
-        end
-        rebuildList()
-        local rows = findPrices(arg)
-        if #rows == 0 then
-            local avg, matched = resolveAvgForModel(arg)
-            if avg and matched then
-                local info = prices[matched]
-                chat(('%s → %s — средняя %s, дней: %d'):format(
-                    normalizeName(arg), matched, fmtMoney(avg), info and #(info.days or {}) or 0))
-                if info and info.days then
-                    for j = 1, math.min(3, #info.days) do
-                        chat(('   %s: %s'):format(info.days[j].date, fmtMoney(info.days[j].price)))
-                    end
-                end
-                return
-            end
-            chat('Не найдено: ' .. arg)
-            return
-        end
-        for i = 1, math.min(#rows, 5) do
-            local r = rows[i]
-            local info = prices[r.name]
-            chat(('%s — средняя %s, дней: %d'):format(r.name, fmtMoney(r.price), info and #(info.days or {}) or 0))
-            if info and info.days then
-                for j = 1, math.min(3, #info.days) do
-                    chat(('   %s: %s'):format(info.days[j].date, fmtMoney(info.days[j].price)))
-                end
-            end
-        end
-    end
-    sampRegisterChatCommand('abprice', cmdAbPrice)
-    sampRegisterChatCommand('carprice', cmdAbPrice)
+    sampRegisterChatCommand('abprice', scanState.openPriceSearch)
+    sampRegisterChatCommand('carprice', scanState.openPriceSearch)
 
     sampRegisterChatCommand('abupdate', function()
         scanState.checkUpdate(true)
@@ -8143,6 +8762,7 @@ end
 
 function onScriptTerminate(s)
     if s == thisScript() then
+        if scanState.marketplace.quality.escapeHeld then pcall(setVirtualKeyDown,0x1B,false) end
         if scanState.duplicateInstance then return end
         if not scanState.startupReady then pcall(scanState.releaseInstance); return end
         pcall(scanState.marketplace.close)

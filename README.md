@@ -5,13 +5,13 @@
 <p align="center">
   <a href="https://github.com/andergr0ynd/autoabarz/releases/latest/download/autoabarz.lua"><img src="images/download-auto.svg" width="285" alt="Скачать AutoABarz — с обновлением скрипта"></a>
   &nbsp;
-  <a href="https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.5.lua"><img src="images/download-manual.svg" width="285" alt="Скачать ABarz 1.5 — без обновления скрипта"></a>
+  <a href="https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.6.lua"><img src="images/download-manual.svg" width="285" alt="Скачать ABarz 1.6 — без обновления скрипта"></a>
   &nbsp;
   <a href="https://www.blast.hk/threads/257682/"><img src="images/download-blast.svg" width="285" alt="Скачать с Blast.hk — открыть тему ABarz на форуме"></a>
 </p>
 
 <p align="center">
-  <strong>Версия 1.9.8</strong> · Windows · Arizona RP · MoonLoader<br>
+  <strong>Версия 1.9.9</strong> · Windows · Arizona RP · MoonLoader<br>
   Средние цены и графики, предложения других игроков, тюнинг и учёт сделок — в одном меню.
 </p>
 
@@ -20,7 +20,7 @@
   <a href="#features">Возможности</a> &nbsp;·&nbsp;
   <a href="#commands">Команды</a> &nbsp;·&nbsp;
   <a href="#faq">Вопросы</a> &nbsp;·&nbsp;
-  <a href="CHANGELOG.md">Что нового</a> &nbsp;·&nbsp;
+  <a href="docs/BLAST_CHANGELOG.txt">Что нового</a> &nbsp;·&nbsp;
   <a href="https://www.blast.hk/threads/257682/">Тема на Blast</a>
 </p>
 
@@ -28,16 +28,28 @@
 
 ## Выбери свою сборку
 
-| | **AutoABarz** | **ABarz 1.5** |
+| | **AutoABarz** | **ABarz 1.6** |
 | :--- | :--- | :--- |
-| Файл | [**autoabarz.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/autoabarz.lua) | [**abarz1.5.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.5.lua) |
+| Файл | [**autoabarz.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/autoabarz.lua) | [**abarz1.6.lua**](https://github.com/andergr0ynd/autoabarz/releases/latest/download/abarz1.6.lua) |
 | Возможности | Все функции ABarz | Те же функции |
 | Обновление самого скрипта | Проверка GitHub и загрузка новой версии | Замена файла вручную |
 | Загрузка библиотек ABarz | Автоматически | Автоматически |
 | Кому подойдёт | Хочешь получать обновления через скрипт | Хочешь сам выбирать момент обновления |
 
+Готовые комплекты с библиотеками: [AutoABarz — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/AutoABarz-1.9.9.zip) · [ABarz 1.6 — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/ABarz-1.6-1.9.9.zip).
+
 > [!IMPORTANT]
 > Устанавливай **только один** из этих файлов. Обе сборки используют общие настройки и выполняют одну и ту же работу.
+
+## Новое в 1.9.9
+
+- Качество машины автоматически подхватывается через `/cars` после успешного выставления и передаётся в лот.
+- Установленный тюнинг показывает цены и игровые миниатюры с увеличением при наведении. Иконки читаются из игрового архива в память; массовой распаковки и отдельной библиотеки декодера нет.
+- Цена лота отображается вместе с комиссией 4%. Каталог автоматически обновляется раз в три минуты; ручное обновление и выбор сервера доступны сразу.
+- Исправлены дубли при быстрой замене одинаковых машин и повторном использовании сервером табличек.
+- `/abprice` и `/carprice` открывают поиск машины в основном меню; без названия показывается подсказка.
+
+Цены деталей из текущих лавок VC доступны через **необязательный мост Arizona Market**. Для обычных серверов используется приблизительный коэффициент ×100. У предметов с рейтингом стоимость может отличаться. [Подключение моста и состав комплектов](PUBLISH.md).
 
 <a id="install"></a>
 
@@ -50,7 +62,7 @@
 ```text
 Arizona RP/
 └── moonloader/
-    └── autoabarz.lua        ← или abarz1.5.lua, только один файл
+    └── autoabarz.lua        ← или abarz1.6.lua, только один файл
 ```
 
 Кнопки GitHub скачивают готовый `.lua`-файл. Кнопка **«Скачать с Blast.hk»** открывает тему ABarz на форуме, где можно скачать опубликованные там файлы.
@@ -130,7 +142,7 @@ Arizona RP/
 
 **AutoABarz:** введи `/abupdate` или открой **Настройки → Обновления**. Там же можно включить проверку после входа в игру. После загрузки следуй уведомлению о перезагрузке.
 
-**ABarz 1.5:** скачай новый `abarz1.5.lua`, замени старый файл и перезагрузи скрипты. Самообновления в этой сборке нет, автоматическая установка библиотек работает.
+**ABarz 1.6:** скачай новый `abarz1.6.lua`, замени старый файл и перезагрузи скрипты. Самообновления в этой сборке нет, автоматическая установка библиотек работает.
 
 </details>
 
@@ -158,7 +170,7 @@ Arizona RP/
 
 ```text
 moonloader/
-├── autoabarz.lua                  # либо abarz1.5.lua
+├── autoabarz.lua                  # либо abarz1.6.lua
 ├── lib/
 │   ├── notifications.lua
 │   ├── arizona-cef-dialogs.lua
@@ -182,7 +194,7 @@ moonloader/
 
 ### Нужна помощь или нашёл ошибку?
 
-[**Сообщить об ошибке →**](https://github.com/andergr0ynd/autoabarz/issues/new?template=bug_report.yml) · [Обсуждение на Blast](https://www.blast.hk/threads/257682/) · [История обновлений](CHANGELOG.md)
+[**Сообщить об ошибке →**](https://github.com/andergr0ynd/autoabarz/issues/new?template=bug_report.yml) · [Обсуждение на Blast](https://www.blast.hk/threads/257682/) · [История обновлений](docs/BLAST_CHANGELOG.txt)
 
 При обращении укажи версию скрипта, сервер, действия перед ошибкой и текст ошибки из `moonloader.log`.
 
