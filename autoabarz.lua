@@ -5,7 +5,7 @@
 
 script_name('AutoABarz')
 script_author('pechkin')
-script_version('1.9.9')
+script_version('1.9.10')
 script_description('Автобазар Arizona: цены, продажи, сделки, автообновление GitHub')
 require 'lib.moonloader'
 local bit = require 'bit'
@@ -8127,6 +8127,7 @@ scanState.libraryFiles = {
     {name='arizona-events/subprocess.lua',marker='return subprocess',minSize=32},
     {name='arizona-events/core.lua',marker='bad packet size',minSize=32},
     {name='arizona-events/bitstream.lua',marker='oversized string',minSize=32},
+    {name='abarz-market-bridge.lua',marker='return bridge',minSize=1000},
 }
 
 function scanState.libraryStatus(text)
@@ -8221,6 +8222,98 @@ end
 
 function scanState.ensureNotifications()
     return scanState.ensureLibraries({['notifications.lua']=true})
+end
+
+scanState.marketBridge={}
+function scanState.marketBridge.read(path)
+    local f=io.open(path,'rb')
+    if not f then return end
+    local bytes=f:read(2000001);f:close()
+    if type(bytes)=='string' and #bytes<=2000000 then return bytes end
+end
+function scanState.marketBridge.write(path,bytes)
+    local f,why=io.open(path,'wb')
+    if not f then return false,why end
+    local wrote,err=f:write(bytes);local closed,closeErr=f:close()
+    return not not (wrote and closed),err or closeErr
+end
+function scanState.marketBridge.install()
+    local bridge=scanState.marketBridge
+    local root=getWorkingDirectory()
+    local path=root..'\\#ArzMarket[3_57].lua'
+    local original=bridge.read(path)
+    if not original then return 'missing' end
+    local marker='-- Local ABarz price bridge;'
+    if original:sub(1,#marker)==marker then
+        local name=original:match('/ArzMarket/abarz%-bridge/([%w%.%-]+%.luac)')
+        if name and bridge.read(root..'\\ArzMarket\\abarz-bridge\\'..name) then return 'ready' end
+        return 'error','Не найден сохранённый оригинал Arizona Market.'
+    end
+    if original:sub(1,3)~='\27LJ' then return 'unsupported' end
+    if not scanState.libraryFileOk(root..'\\lib\\abarz-market-bridge.lua',
+        {marker='return bridge',minSize=1000}) then return 'error','Библиотека моста ещё не скачана.' end
+    local folder=root..'\\ArzMarket\\abarz-bridge'
+    ensureDir(root..'\\ArzMarket');ensureDir(folder)
+    local name='original-3.57.luac'
+    local backup=folder..'\\'..name
+    local saved=bridge.read(backup)
+    if saved and saved~=original then
+        name=('original-3.57-%d-%d.luac'):format(os.time(),math.random(100000,999999))
+        backup=folder..'\\'..name
+        if bridge.read(backup) then return 'error','Не удалось выбрать имя резервной копии.' end
+        saved=nil
+    end
+    if not saved then
+        local ok,why=bridge.write(backup,original)
+        if not ok or bridge.read(backup)~=original then return 'error','Не удалось сохранить оригинал: '..tostring(why) end
+    end
+    local wrapper=([[-- Local ABarz price bridge; original Arizona Market bytecode is preserved.
+local path=getWorkingDirectory()..'/ArzMarket/abarz-bridge/%s'
+local original,why=loadfile(path)
+if not original then error('ABarz bridge: '..tostring(why)) end
+local ok,bridge=pcall(dofile,getWorkingDirectory()..'/lib/abarz-market-bridge.lua')
+if ok then
+    local installed,reason=pcall(bridge.install)
+    if not installed then print('ABarz price bridge unavailable: '..tostring(reason)) end
+else print('ABarz price bridge unavailable: '..tostring(bridge)) end
+return original()
+]]):format(name)
+    if not loadstring(wrapper) then return 'error','Ошибка подготовки загрузчика моста.' end
+    local suffix=('.abarz-%d-%d'):format(os.time(),math.random(100000,999999))
+    local staged,rollback=path..suffix..'.tmp',path..suffix..'.old'
+    local wrote,why=bridge.write(staged,wrapper)
+    if not wrote or bridge.read(staged)~=wrapper then
+        pcall(os.remove,staged);return 'error','Не удалось подготовить загрузчик: '..tostring(why)
+    end
+    if not os.rename(path,rollback) then pcall(os.remove,staged);return 'error','Не удалось заменить загрузчик Arizona Market.' end
+    if not os.rename(staged,path) then
+        os.rename(rollback,path);pcall(os.remove,staged)
+        return 'error','Не удалось установить загрузчик. Оригинал сохранён в '..backup
+    end
+    pcall(os.remove,rollback)
+    return 'installed',path
+end
+function scanState.ensureMarketBridge()
+    local bridge=scanState.marketBridge
+    if bridge.checked then return end
+    bridge.checked=true
+    local ok,state,detail=pcall(bridge.install)
+    if not ok or state=='error' then
+        chat('Мост Arizona Market не подключён: '..tostring(ok and detail or state),'warning')
+        return
+    end
+    if state~='installed' then return end
+    local reloaded=false
+    if type(script)=='table' and type(script.list)=='function' then
+        pcall(function()
+            for _,loaded in ipairs(script.list()) do
+                local path=tostring(loaded.path or ''):gsub('\\','/'):lower()
+                if path==detail:gsub('\\','/'):lower() then loaded:reload();reloaded=true;break end
+            end
+        end)
+    end
+    chat(reloaded and 'Мост Arizona Market подключён. В /crr выберите Vice City.'
+        or 'Мост Arizona Market подключён. Перезагрузите Arizona Market и выберите Vice City в /crr.')
 end
 
 function scanState.loadArizonaEvents()
@@ -8674,6 +8767,7 @@ function main()
     pcall(scanState.loadSettings)
     pcall(scanState.cloud.load)
     scanState.startupReady=true
+    scanState.ensureMarketBridge()
     cleanupCurrencyNames()
     pcall(carImg.loadVehiclesMap, false)
 

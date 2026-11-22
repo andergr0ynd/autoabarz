@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <strong>Версия 1.9.9</strong> · Windows · Arizona RP · MoonLoader<br>
+  <strong>Версия 1.9.10</strong> · Windows · Arizona RP · MoonLoader<br>
   Средние цены и графики, предложения других игроков, тюнинг и учёт сделок — в одном меню.
 </p>
 
@@ -20,7 +20,7 @@
   <a href="#features">Возможности</a> &nbsp;·&nbsp;
   <a href="#commands">Команды</a> &nbsp;·&nbsp;
   <a href="#faq">Вопросы</a> &nbsp;·&nbsp;
-  <a href="docs/BLAST_CHANGELOG.txt">Что нового</a> &nbsp;·&nbsp;
+  <a href="https://github.com/andergr0ynd/autoabarz/releases/latest">Что нового</a> &nbsp;·&nbsp;
   <a href="https://www.blast.hk/threads/257682/">Тема на Blast</a>
 </p>
 
@@ -36,12 +36,14 @@
 | Загрузка библиотек ABarz | Автоматически | Автоматически |
 | Кому подойдёт | Хочешь получать обновления через скрипт | Хочешь сам выбирать момент обновления |
 
-Готовые комплекты с библиотеками: [AutoABarz — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/AutoABarz-1.9.9.zip) · [ABarz 1.6 — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/ABarz-1.6-1.9.9.zip).
+Готовые комплекты с библиотеками: [AutoABarz — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/AutoABarz-1.9.10.zip) · [ABarz 1.6 — ZIP](https://github.com/andergr0ynd/autoabarz/releases/latest/download/ABarz-1.6-1.9.10.zip).
 
 > [!IMPORTANT]
 > Устанавливай **только один** из этих файлов. Обе сборки используют общие настройки и выполняют одну и ту же работу.
 
-## Новое в 1.9.9
+## Новое в 1.9.10
+
+- Обе сборки автоматически скачивают все семь библиотек ABarz, включая мост, и подключают его к установленному Arizona Market 3.57.
 
 - Качество машины автоматически подхватывается через `/cars` после успешного выставления и передаётся в лот.
 - Установленный тюнинг показывает цены и игровые миниатюры с увеличением при наведении. Иконки читаются из игрового архива в память; массовой распаковки и отдельной библиотеки декодера нет.
@@ -49,7 +51,7 @@
 - Исправлены дубли при быстрой замене одинаковых машин и повторном использовании сервером табличек.
 - `/abprice` и `/carprice` открывают поиск машины в основном меню; без названия показывается подсказка.
 
-Цены деталей из текущих лавок VC доступны через **необязательный мост Arizona Market**. Для обычных серверов используется приблизительный коэффициент ×100. У предметов с рейтингом стоимость может отличаться. [Подключение моста и состав комплектов](PUBLISH.md).
+Мост Arizona Market скачивается автоматически вместе с остальными библиотеками. Если установлен оригинальный Arizona Market 3.57, скрипт подключает мост с сохранением оригинала; ручной установщик не нужен. Для цен деталей откройте `/crr` и выберите Vice City. Для обычных серверов используется приблизительный коэффициент ×100. У предметов с рейтингом стоимость может отличаться. [Подключение моста и состав комплектов](PUBLISH.md).
 
 <a id="install"></a>
 
@@ -118,7 +120,8 @@ Arizona RP/
 
 - `notifications.lua`;
 - `arizona-cef-dialogs.lua`;
-- `arizona-events/init.lua`, `core.lua`, `bitstream.lua` и `subprocess.lua`.
+- `arizona-events/init.lua`, `core.lua`, `bitstream.lua` и `subprocess.lua`;
+- с **1.9.10** — `abarz-market-bridge.lua` с автоматическим подключением к Arizona Market 3.57.
 
 Сначала используется GitHub, затем резервный адрес. Перед установкой проверяются Lua-код и необходимые признаки реализации. После установки комплекта выполняется один перезапуск.
 
@@ -166,7 +169,7 @@ Arizona RP/
 
 Также используются стандартные модули LuaJIT / сборки MoonLoader: `ffi`, `bit`, `encoding`, `json`, `vector3d`, `socket.http`, `ssl.https` и `ltn12`. Загрузчик ABarz не устанавливает весь MoonLoader и его бинарные зависимости.
 
-**Скачивается автоматически:** комплект из шести Lua-файлов в [lib](lib) и [логотип](images/abarz-logo.png).
+**Скачивается автоматически:** комплект из семи Lua-файлов в [lib](lib) и [логотип](images/abarz-logo.png).
 
 ```text
 moonloader/
@@ -174,6 +177,7 @@ moonloader/
 ├── lib/
 │   ├── notifications.lua
 │   ├── arizona-cef-dialogs.lua
+│   ├── abarz-market-bridge.lua
 │   └── arizona-events/
 │       ├── init.lua
 │       ├── core.lua
@@ -194,7 +198,7 @@ moonloader/
 
 ### Нужна помощь или нашёл ошибку?
 
-[**Сообщить об ошибке →**](https://github.com/andergr0ynd/autoabarz/issues/new?template=bug_report.yml) · [Обсуждение на Blast](https://www.blast.hk/threads/257682/) · [История обновлений](docs/BLAST_CHANGELOG.txt)
+[**Сообщить об ошибке →**](https://github.com/andergr0ynd/autoabarz/issues/new?template=bug_report.yml) · [Обсуждение на Blast](https://www.blast.hk/threads/257682/) · [История обновлений](https://github.com/andergr0ynd/autoabarz/releases/latest)
 
 При обращении укажи версию скрипта, сервер, действия перед ошибкой и текст ошибки из `moonloader.log`.
 
